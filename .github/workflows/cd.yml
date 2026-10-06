@@ -8,17 +8,24 @@ name: CD
 # production environment... implement the reusable deployment workflow,
 # document required secrets, keep deployment disabled until configured."
 #
-# Required secrets to actually enable deployment (none of these exist yet
-# in this repo -- see docs/PHASE_3.md's Deployment section):
-#   DEPLOY_TARGET_CONFIGURED   -- set to "true" once the rest below exist
-#   CONTAINER_REGISTRY          -- e.g. ghcr.io/<org>/aster-row
+# Required secrets to actually enable deployment:
+#   DEPLOY_TARGET_CONFIGURED -- set to "true" once the rest below exist
+#   CONTAINER_REGISTRY      -- e.g. ghcr.io/aadit23042006/aster-support-ai
 #   REGISTRY_USERNAME / REGISTRY_PASSWORD (or a cloud-specific OIDC role)
 #   PRODUCTION_HOST / SSH_KEY, or a cloud deploy command, for the actual
-#     rollout step (left as a documented placeholder -- see below)
+#   rollout step.
+#
+# Deployment remains a documented placeholder until a production target
+# is configured.
+
 on:
   push:
     branches: [main]
   workflow_dispatch: {}
+
+env:
+  # GHCR repository names must be lowercase.
+  GHCR_NAMESPACE: aadit23042006/aster-support-ai
 
 jobs:
   build-and-push:
@@ -26,8 +33,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -42,8 +51,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
-            ghcr.io/${{ github.repository }}/backend:latest
+            ghcr.io/${{ env.GHCR_NAMESPACE }}/backend:${{ github.sha }}
+            ghcr.io/${{ env.GHCR_NAMESPACE }}/backend:latest
 
       - name: Build and push frontend image
         uses: docker/build-push-action@v5
@@ -53,19 +62,22 @@ jobs:
           build-args: |
             NEXT_PUBLIC_API_URL=${{ vars.PRODUCTION_API_URL || 'http://localhost:8000' }}
           tags: |
-            ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
-            ghcr.io/${{ github.repository }}/frontend:latest
+            ghcr.io/${{ env.GHCR_NAMESPACE }}/frontend:${{ github.sha }}
+            ghcr.io/${{ env.GHCR_NAMESPACE }}/frontend:latest
 
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-push
-    environment: production  # requires manual approval in repo settings
+    environment: production
+
     steps:
       - name: Check deployment is configured
         id: check
         run: |
           if [ "${{ secrets.DEPLOY_TARGET_CONFIGURED }}" != "true" ]; then
-            echo "No deployment target configured yet -- see docs/PHASE_3.md. Images were built and pushed above; stopping here rather than deploying to an unknown environment."
+            echo "No deployment target configured yet -- see docs/PHASE_3.md."
+            echo "Images were built and pushed above; stopping here rather than"
+            echo "deploying to an unknown environment."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -73,12 +85,23 @@ jobs:
 
       - name: Run database migrations
         if: steps.check.outputs.configured == 'true'
-        run: "echo 'Placeholder: run alembic upgrade head against the production DATABASE_URL, e.g. via a one-off job/task on the deploy target.'"
+        run: |
+          echo "Placeholder: run alembic upgrade head against the production"
+          echo "DATABASE_URL, e.g. via a one-off job/task on the deploy target."
 
       - name: Deploy
         if: steps.check.outputs.configured == 'true'
-        run: "echo 'Placeholder: roll out ghcr.io/${{ github.repository }}/backend:${{ github.sha }} and :frontend to the configured target (see docs/PHASE_3.md for the exact command once a provider is chosen).'"
+        run: |
+          echo "Placeholder: roll out"
+          echo "ghcr.io/${{ env.GHCR_NAMESPACE }}/backend:${{ github.sha }}"
+          echo "and"
+          echo "ghcr.io/${{ env.GHCR_NAMESPACE }}/frontend:${{ github.sha }}"
+          echo "to the configured target."
+          echo "See docs/PHASE_3.md for the exact command once a provider"
+          echo "is chosen."
 
       - name: Smoke test
         if: steps.check.outputs.configured == 'true'
-        run: "echo 'Placeholder: curl the deployed /health/ready and fail this job (exit 1) if it does not return 200.'"
+        run: |
+          echo "Placeholder: curl the deployed /health/ready and fail this"
+          echo "job if it does not return HTTP 200."
