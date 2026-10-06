@@ -1,0 +1,84 @@
+name: CD
+
+# Builds and tags container images on every push to main, once CI has
+# passed. Actual deployment (the `deploy` job) is a real, reusable
+# workflow but stays a manual approval gate (`environment: production`)
+# and short-circuits immediately if no deployment target is configured --
+# per the Phase 3 brief: "Do not automatically deploy to an unknown
+# production environment... implement the reusable deployment workflow,
+# document required secrets, keep deployment disabled until configured."
+#
+# Required secrets to actually enable deployment (none of these exist yet
+# in this repo -- see docs/PHASE_3.md's Deployment section):
+#   DEPLOY_TARGET_CONFIGURED   -- set to "true" once the rest below exist
+#   CONTAINER_REGISTRY          -- e.g. ghcr.io/<org>/aster-row
+#   REGISTRY_USERNAME / REGISTRY_PASSWORD (or a cloud-specific OIDC role)
+#   PRODUCTION_HOST / SSH_KEY, or a cloud deploy command, for the actual
+#     rollout step (left as a documented placeholder -- see below)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/backend:latest
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.PRODUCTION_API_URL || 'http://localhost:8000' }}
+          tags: |
+            ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/frontend:latest
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production  # requires manual approval in repo settings
+    steps:
+      - name: Check deployment is configured
+        id: check
+        run: |
+          if [ "${{ secrets.DEPLOY_TARGET_CONFIGURED }}" != "true" ]; then
+            echo "No deployment target configured yet -- see docs/PHASE_3.md. Images were built and pushed above; stopping here rather than deploying to an unknown environment."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run database migrations
+        if: steps.check.outputs.configured == 'true'
+        run: "echo 'Placeholder: run alembic upgrade head against the production DATABASE_URL, e.g. via a one-off job/task on the deploy target.'"
+
+      - name: Deploy
+        if: steps.check.outputs.configured == 'true'
+        run: "echo 'Placeholder: roll out ghcr.io/${{ github.repository }}/backend:${{ github.sha }} and :frontend to the configured target (see docs/PHASE_3.md for the exact command once a provider is chosen).'"
+
+      - name: Smoke test
+        if: steps.check.outputs.configured == 'true'
+        run: "echo 'Placeholder: curl the deployed /health/ready and fail this job (exit 1) if it does not return 200.'"

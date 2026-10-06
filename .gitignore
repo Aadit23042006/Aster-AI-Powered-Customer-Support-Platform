@@ -1,0 +1,210 @@
+# ============================================================
+# Aster Support AI — Root .gitignore
+# ============================================================
+
+# ------------------------------------------------------------
+# Environment / secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.example.*
+*.local
+
+# Local secret/config files
+secrets/
+.local/
+.local.*
+*.secret
+*.credentials
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage.json
+
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+*.whl
+
+# ------------------------------------------------------------
+# Application runtime / generated data
+# ------------------------------------------------------------
+logs/
+!logs/.gitkeep
+
+app/data_cache/
+!app/data_cache/.gitkeep
+
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.pid
+
+# Runtime exports / temporary application data
+runtime/
+tmp/
+temp/
+
+# ------------------------------------------------------------
+# Test / evaluation output
+# ------------------------------------------------------------
+test-results/
+junit.xml
+
+evaluation/results/
+evaluation/output/
+
+.pytest_cache/
+
+# ------------------------------------------------------------
+# Node / Next.js frontend
+# ------------------------------------------------------------
+node_modules/
+frontend/node_modules/
+
+.next/
+frontend/.next/
+
+out/
+frontend/out/
+
+build/
+frontend/build/
+
+coverage/
+frontend/coverage/
+
+*.tsbuildinfo
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Package-manager caches / local tooling
+.npm/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/install-state.gz
+.yarn/build-state.yml
+
+# ------------------------------------------------------------
+# Frontend environment files
+# ------------------------------------------------------------
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+!frontend/.env.example.*
+
+# ------------------------------------------------------------
+# Docker / local overrides
+# ------------------------------------------------------------
+docker-compose.override.yml
+docker-compose.override.yaml
+compose.override.yml
+compose.override.yaml
+
+# Local Docker environment files
+docker-compose.local.yml
+docker-compose.local.yaml
+
+# ------------------------------------------------------------
+# IDE / editor files
+# ------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+
+.idea/
+*.iml
+
+# ------------------------------------------------------------
+# OS / desktop metadata
+# ------------------------------------------------------------
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ------------------------------------------------------------
+# Patch / temporary files
+# ------------------------------------------------------------
+*.patch
+*.diff
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+
+# ------------------------------------------------------------
+# Certificates / private keys
+# ------------------------------------------------------------
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# ------------------------------------------------------------
+# Local archives / generated exports
+# ------------------------------------------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# ------------------------------------------------------------
+# Vercel / deployment-local metadata
+# ------------------------------------------------------------
+.vercel/
+
+# ------------------------------------------------------------
+# Miscellaneous local files
+# ------------------------------------------------------------
+.DockerDesktop/
+*.bak
+*.old
+
+# ------------------------------------------------------------
+# OS / application-generated metadata
+# ------------------------------------------------------------
+.Trashes/
+.fseventsd
+.Spotlight-V100

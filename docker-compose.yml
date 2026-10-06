@@ -1,0 +1,383 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: aster_row
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+    - aster_fix_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U postgres -d aster_row
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+    - aster_fix_network
+  redis:
+    image: redis:7-alpine
+    volumes:
+    - aster_fix_redis_data:/data
+    command:
+    - redis-server
+    - --appendonly
+    - 'yes'
+    healthcheck:
+      test:
+      - CMD
+      - redis-cli
+      - ping
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+    - aster_fix_network
+  test-db-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: postgres
+    entrypoint:
+    - /bin/sh
+    - -c
+    command:
+    - "set -e\n\necho \"Checking test database...\"\n\nuntil pg_isready -h postgres\
+      \ -U postgres -d aster_row; do\n  echo \"Waiting for PostgreSQL...\"\n  sleep\
+      \ 2\ndone\n\nif psql -h postgres -U postgres -d postgres -tAc \"SELECT 1 FROM\
+      \ pg_database WHERE datname='aster_row_test'\" | grep -q 1; then\n  echo \"\
+      Test database aster_row_test already exists.\"\nelse\n  echo \"Creating test\
+      \ database aster_row_test...\"\n  createdb -h postgres -U postgres aster_row_test\n\
+      \  echo \"Test database created.\"\nfi\n\necho \"Test database initialization\
+      \ complete.\"\n"
+    restart: 'no'
+    networks:
+    - aster_fix_network
+  clean-reset:
+    profiles:
+    - maintenance
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command:
+    - /bin/sh
+    - -c
+    - 'python -m alembic upgrade head &&
+
+      python scripts/reset_clean_demo_data.py
+
+      '
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@postgres:5432/aster_row}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+    - aster_fix_network
+  auth-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      echo "Running database migrations..."
+      python -m alembic upgrade head
+      echo "Ensuring canonical authentication accounts..."
+      python scripts/ensure_auth_accounts.py
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@postgres:5432/aster_row}
+    volumes:
+    - ./app:/app/app
+    - ./scripts:/app/scripts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+    networks:
+    - aster_fix_network
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command:
+    - /bin/sh
+    - -c
+    - "echo \"Waiting for PostgreSQL to be reachable...\"\nuntil python -c \"import\
+      \ socket; s=socket.create_connection(('postgres',5432),2); s.close()\" >/dev/null\
+      \ 2>&1; do\n  echo \"PostgreSQL is not reachable yet; retrying...\"\n  sleep\
+      \ 1\ndone\necho \"PostgreSQL is reachable.\"\n\necho \"Running database migrations...\"\
+      \npython -m alembic upgrade head\n\necho \"Starting FastAPI backend...\"\nexec\
+      \ uvicorn app.server:app --host 0.0.0.0 --port 8000\n"
+    environment:
+      PYTHONPATH: /app
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gemini-2.5-flash}
+      CHAT_FALLBACK_MODEL: ${CHAT_FALLBACK_MODEL:-gemini-3.5-flash-lite}
+      LLM_MAX_ATTEMPTS_PER_MODEL: ${LLM_MAX_ATTEMPTS_PER_MODEL:-2}
+      LLM_RETRY_INITIAL_DELAY_SECONDS: ${LLM_RETRY_INITIAL_DELAY_SECONDS:-0.5}
+      LLM_RETRY_MAX_DELAY_SECONDS: ${LLM_RETRY_MAX_DELAY_SECONDS:-2.0}
+      LLM_FAILOVER_HUMAN_HANDOFF: ${LLM_FAILOVER_HUMAN_HANDOFF:-1}
+      AI_MODEL_PRICING_JSON: ${AI_MODEL_PRICING_JSON:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-001}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      RECOMMENDATION_INTELLIGENCE_ENABLED: ${RECOMMENDATION_INTELLIGENCE_ENABLED:-true}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
+      RETRIEVAL_MIN_SIMILARITY: ${RETRIEVAL_MIN_SIMILARITY:-0.45}
+      RETRIEVAL_SEMANTIC_WEIGHT: ${RETRIEVAL_SEMANTIC_WEIGHT:-0.65}
+      RETRIEVAL_KEYWORD_WEIGHT: ${RETRIEVAL_KEYWORD_WEIGHT:-0.35}
+      RETRIEVAL_KEYWORD_SATURATION_K: ${RETRIEVAL_KEYWORD_SATURATION_K:-2.5}
+      RETRIEVAL_HYBRID_MIN_SCORE: ${RETRIEVAL_HYBRID_MIN_SCORE:-0.22}
+      MAX_HISTORY_TURNS: ${MAX_HISTORY_TURNS:-6}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-1800}
+      USE_MOCK_LLM: ${USE_MOCK_LLM:-0}
+      MODEL_ROUTER_ENABLED: ${MODEL_ROUTER_ENABLED:-true}
+      MODEL_ROUTER_RULES_JSON: ${MODEL_ROUTER_RULES_JSON:-}
+      SELF_SIGNUP_ENABLED: ${SELF_SIGNUP_ENABLED:-false}
+      LOGIN_ALLOWLIST_ENABLED: ${LOGIN_ALLOWLIST_ENABLED:-true}
+      ALLOWED_LOGIN_EMAILS: ${ALLOWED_LOGIN_EMAILS:-admin@example.com,support@example.com,customer@example.com}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@postgres:5432/aster_row}
+      TEST_DATABASE_URL: ${TEST_DATABASE_URL:-postgresql+psycopg2://postgres:postgres@postgres:5432/aster_row_test}
+      AUTH_SECRET: ${AUTH_SECRET:-change-me-to-a-long-random-development-secret-please-change}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-1440}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-365}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      PII_REDACTION_ENABLED: ${PII_REDACTION_ENABLED:-true}
+      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-true}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-console}
+      WORKERS_ENABLED: ${WORKERS_ENABLED:-true}
+      MONITORING_ENABLED: ${MONITORING_ENABLED:-true}
+      ERROR_TRACKING_ENABLED: ${ERROR_TRACKING_ENABLED:-false}
+      VOICE_ENABLED: ${VOICE_ENABLED:-true}
+      VOICE_PROVIDER: ${VOICE_PROVIDER:-browser}
+      VOICE_MAX_DURATION_SECONDS: ${VOICE_MAX_DURATION_SECONDS:-120}
+      VOICE_MAX_FILE_SIZE_MB: ${VOICE_MAX_FILE_SIZE_MB:-10}
+      IMAGE_SUPPORT_ENABLED: ${IMAGE_SUPPORT_ENABLED:-false}
+      MAX_IMAGE_SIZE_MB: ${MAX_IMAGE_SIZE_MB:-10}
+      CHAT_ATTACHMENT_MAX_SIZE_MB: ${CHAT_ATTACHMENT_MAX_SIZE_MB:-20}
+      MULTILINGUAL_ENABLED: ${MULTILINGUAL_ENABLED:-true}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-en}
+      RECOMMENDATIONS_ENABLED: ${RECOMMENDATIONS_ENABLED:-true}
+      MULTI_TENANT_ENABLED: ${MULTI_TENANT_ENABLED:-true}
+      WEBHOOKS_ENABLED: ${WEBHOOKS_ENABLED:-true}
+      WEBHOOK_MAX_RETRIES: ${WEBHOOK_MAX_RETRIES:-3}
+      API_KEYS_ENABLED: ${API_KEYS_ENABLED:-true}
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY:-}
+    ports:
+    - 8000:8000
+    volumes:
+    - ./app:/app/app
+    - ./knowledge-base:/app/knowledge-base
+    - ./scripts:/app/scripts
+    - ./tests_web:/app/tests_web
+    - ./tests:/app/tests
+    - ./docs:/app/docs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      test-db-init:
+        condition: service_completed_successfully
+      auth-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"
+        || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+    - aster_fix_network
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command:
+    - /bin/sh
+    - -c
+    - 'celery -A app.workers.celery_app:celery_app worker --loglevel=info
+
+      '
+    environment:
+      PYTHONPATH: /app
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gemini-2.5-flash}
+      CHAT_FALLBACK_MODEL: ${CHAT_FALLBACK_MODEL:-gemini-3.5-flash-lite}
+      LLM_MAX_ATTEMPTS_PER_MODEL: ${LLM_MAX_ATTEMPTS_PER_MODEL:-2}
+      LLM_RETRY_INITIAL_DELAY_SECONDS: ${LLM_RETRY_INITIAL_DELAY_SECONDS:-0.5}
+      LLM_RETRY_MAX_DELAY_SECONDS: ${LLM_RETRY_MAX_DELAY_SECONDS:-2.0}
+      LLM_FAILOVER_HUMAN_HANDOFF: ${LLM_FAILOVER_HUMAN_HANDOFF:-1}
+      AI_MODEL_PRICING_JSON: ${AI_MODEL_PRICING_JSON:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-001}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      MODEL_ROUTER_ENABLED: ${MODEL_ROUTER_ENABLED:-true}
+      MODEL_ROUTER_RULES_JSON: ${MODEL_ROUTER_RULES_JSON:-}
+      SELF_SIGNUP_ENABLED: ${SELF_SIGNUP_ENABLED:-false}
+      LOGIN_ALLOWLIST_ENABLED: ${LOGIN_ALLOWLIST_ENABLED:-true}
+      ALLOWED_LOGIN_EMAILS: ${ALLOWED_LOGIN_EMAILS:-admin@example.com,support@example.com,customer@example.com}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@postgres:5432/aster_row}
+      TEST_DATABASE_URL: ${TEST_DATABASE_URL:-postgresql+psycopg2://postgres:postgres@postgres:5432/aster_row_test}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      AUTH_SECRET: ${AUTH_SECRET:-change-me-to-a-long-random-development-secret-please-change}
+      PII_REDACTION_ENABLED: ${PII_REDACTION_ENABLED:-true}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-true}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-console}
+      MONITORING_ENABLED: ${MONITORING_ENABLED:-true}
+      ERROR_TRACKING_ENABLED: ${ERROR_TRACKING_ENABLED:-false}
+      WORKERS_ENABLED: ${WORKERS_ENABLED:-true}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
+      VOICE_ENABLED: ${VOICE_ENABLED:-true}
+      IMAGE_SUPPORT_ENABLED: ${IMAGE_SUPPORT_ENABLED:-false}
+      MAX_IMAGE_SIZE_MB: ${MAX_IMAGE_SIZE_MB:-10}
+      CHAT_ATTACHMENT_MAX_SIZE_MB: ${CHAT_ATTACHMENT_MAX_SIZE_MB:-20}
+      MULTILINGUAL_ENABLED: ${MULTILINGUAL_ENABLED:-true}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-en}
+      RECOMMENDATIONS_ENABLED: ${RECOMMENDATIONS_ENABLED:-true}
+      MULTI_TENANT_ENABLED: ${MULTI_TENANT_ENABLED:-true}
+      WEBHOOKS_ENABLED: ${WEBHOOKS_ENABLED:-true}
+      WEBHOOK_MAX_RETRIES: ${WEBHOOK_MAX_RETRIES:-3}
+      API_KEYS_ENABLED: ${API_KEYS_ENABLED:-true}
+    volumes:
+    - ./app:/app/app
+    - ./knowledge-base:/app/knowledge-base
+    - ./scripts:/app/scripts
+    depends_on:
+      backend:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      test-db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - celery -A app.workers.celery_app:celery_app inspect ping -d celery@$${HOSTNAME}
+        --timeout=5
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+    - aster_fix_network
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command:
+    - /bin/sh
+    - -c
+    - 'celery -A app.workers.celery_app:celery_app beat --loglevel=info
+
+      '
+    environment:
+      PYTHONPATH: /app
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gemini-2.5-flash}
+      CHAT_FALLBACK_MODEL: ${CHAT_FALLBACK_MODEL:-gemini-3.5-flash-lite}
+      LLM_MAX_ATTEMPTS_PER_MODEL: ${LLM_MAX_ATTEMPTS_PER_MODEL:-2}
+      LLM_RETRY_INITIAL_DELAY_SECONDS: ${LLM_RETRY_INITIAL_DELAY_SECONDS:-0.5}
+      LLM_RETRY_MAX_DELAY_SECONDS: ${LLM_RETRY_MAX_DELAY_SECONDS:-2.0}
+      LLM_FAILOVER_HUMAN_HANDOFF: ${LLM_FAILOVER_HUMAN_HANDOFF:-1}
+      AI_MODEL_PRICING_JSON: ${AI_MODEL_PRICING_JSON:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-001}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      MODEL_ROUTER_ENABLED: ${MODEL_ROUTER_ENABLED:-true}
+      MODEL_ROUTER_RULES_JSON: ${MODEL_ROUTER_RULES_JSON:-}
+      SELF_SIGNUP_ENABLED: ${SELF_SIGNUP_ENABLED:-false}
+      LOGIN_ALLOWLIST_ENABLED: ${LOGIN_ALLOWLIST_ENABLED:-true}
+      ALLOWED_LOGIN_EMAILS: ${ALLOWED_LOGIN_EMAILS:-admin@example.com,support@example.com,customer@example.com}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@postgres:5432/aster_row}
+      TEST_DATABASE_URL: ${TEST_DATABASE_URL:-postgresql+psycopg2://postgres:postgres@postgres:5432/aster_row_test}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      AUTH_SECRET: ${AUTH_SECRET:-change-me-to-a-long-random-development-secret-please-change}
+      PII_REDACTION_ENABLED: ${PII_REDACTION_ENABLED:-true}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-true}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-console}
+      MONITORING_ENABLED: ${MONITORING_ENABLED:-true}
+      ERROR_TRACKING_ENABLED: ${ERROR_TRACKING_ENABLED:-false}
+      WORKERS_ENABLED: ${WORKERS_ENABLED:-true}
+      MULTILINGUAL_ENABLED: ${MULTILINGUAL_ENABLED:-true}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-en}
+      RECOMMENDATIONS_ENABLED: ${RECOMMENDATIONS_ENABLED:-true}
+      MULTI_TENANT_ENABLED: ${MULTI_TENANT_ENABLED:-true}
+      WEBHOOKS_ENABLED: ${WEBHOOKS_ENABLED:-true}
+      WEBHOOK_MAX_RETRIES: ${WEBHOOK_MAX_RETRIES:-3}
+      API_KEYS_ENABLED: ${API_KEYS_ENABLED:-true}
+    volumes:
+    - ./app:/app/app
+    - ./knowledge-base:/app/knowledge-base
+    - ./scripts:/app/scripts
+    depends_on:
+      backend:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      test-db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - python -c "import os; os.kill(1, 0)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+    - aster_fix_network
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+    - 3000:3000
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+    - aster_fix_network
+volumes:
+  aster_fix_postgres_data: {}
+  aster_fix_redis_data: {}
+networks:
+  aster_fix_network:
+    driver: bridge
+    name: aster-fix-app-network

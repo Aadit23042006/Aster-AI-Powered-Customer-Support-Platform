@@ -1,0 +1,33 @@
+google-genai>=2.20,<3
+numpy>=2.0,<3
+PyYAML>=6.0,<7
+pydantic>=2.10,<3
+pydantic[email]>=2.10,<3
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-dotenv>=1.0,<2
+pytest>=8.0,<10
+
+# --- Phase 1: web application layer ---
+sqlalchemy>=2.0,<3
+greenlet>=3.0,<4
+psycopg2-binary>=2.9,<3
+asyncpg>=0.29,<1
+alembic>=1.13,<2
+bcrypt>=4.0,<5
+pyjwt>=2.9,<3
+python-multipart>=0.0.9,<1
+httpx>=0.27,<1
+
+# --- Phase 2: knowledge base document upload parsing (Feature 13) ---
+pypdf>=5.0,<6
+python-docx>=1.1,<2
+openpyxl>=3.1,<4
+
+# --- Phase 3: production-grade engineering ---
+redis>=5.0,<6
+celery>=5.4,<6
+sentry-sdk>=2.0,<3
+
+# --- Phase 4: webhook secret encryption ---
+cryptography>=42,<47
