@@ -23,10 +23,11 @@ The order flow supports three safe paths:
   authenticated customer's own PostgreSQL orders.
 
 The latest-order path never searches globally for an order. It first
-resolves the newest order belonging to the authenticated user and then
+resolves the newest order belonging to the authenticated customer and then
 passes that order number through the existing customer-safe
 `DBOrderLookupTool`.
 """
+
 from __future__ import annotations
 
 import logging
@@ -128,7 +129,13 @@ class TurnResult:
     handoff: bool
     handoff_reason: str | None
     insufficient_information: bool
-    general_question: bool
+
+    # Backward-compatible default.
+    #
+    # Older tests and callers construct TurnResult without this field.
+    # The agent still explicitly supplies the real value when returning
+    # from handle_turn().
+    general_question: bool = False
 
 
 def _format_retrieved_block(hits) -> str:
@@ -177,6 +184,7 @@ class Agent:
         self._agent_policy_text = load_agent_policy_text(kb_dir)
 
     # -- Phase 1 web-app additions (additive only) -------------------------
+
     def set_order_tool(self, order_tool: OrderLookupTool) -> None:
         """Swap the order-lookup tool at runtime.
 
@@ -203,6 +211,7 @@ class Agent:
         return self._retriever
 
     # -- public API ---------------------------------------------------------
+
     @staticmethod
     def _looks_like_general_knowledge_question(text: str) -> bool:
         """Detect questions that are clearly unrelated to Aster & Row.
@@ -212,22 +221,65 @@ class Agent:
         wins and stays on the RAG path.
         """
         lowered = " ".join((text or "").lower().split())
+
         if not lowered:
             return False
 
         company_markers = (
-            "aster", "aster & row", "order", "ord-", "delivery",
-            "deliver", "shipping", "shipment", "tracking", "package",
-            "parcel", "return", "refund", "exchange", "warranty",
-            "product", "bag", "tumbler", "drinkware", "travel accessory",
-            "gift card", "membership", "discount", "promotion", "price",
-            "coupon", "address change", "cancel", "cancellation",
-            "ticket", "support", "support agent", "human", "specialist",
-            "customer", "account", "profile", "my purchase", "my order",
-            "our policy", "your policy", "return policy", "shipping policy",
-            "ऑर्डर", "डिलीवरी", "रिफंड", "वापसी", "सपोर्ट",
+            "aster",
+            "aster & row",
+            "order",
+            "ord-",
+            "delivery",
+            "deliver",
+            "shipping",
+            "shipment",
+            "tracking",
+            "package",
+            "parcel",
+            "return",
+            "refund",
+            "exchange",
+            "warranty",
+            "product",
+            "bag",
+            "tumbler",
+            "drinkware",
+            "travel accessory",
+            "gift card",
+            "membership",
+            "discount",
+            "promotion",
+            "price",
+            "coupon",
+            "address change",
+            "cancel",
+            "cancellation",
+            "ticket",
+            "support",
+            "support agent",
+            "human",
+            "specialist",
+            "customer",
+            "account",
+            "profile",
+            "my purchase",
+            "my order",
+            "our policy",
+            "your policy",
+            "return policy",
+            "shipping policy",
+            "ऑर्डर",
+            "डिलीवरी",
+            "रिफंड",
+            "वापसी",
+            "सपोर्ट",
         )
-        return not any(marker in lowered for marker in company_markers)
+
+        return not any(
+            marker in lowered
+            for marker in company_markers
+        )
 
     def handle_turn(
         self,
@@ -237,7 +289,10 @@ class Agent:
         turn_start = time.perf_counter()
 
         session = self._sessions.get_or_create(session_id)
-        general_question = self._looks_like_general_knowledge_question(user_message)
+
+        general_question = self._looks_like_general_knowledge_question(
+            user_message
+        )
 
         history_contents = [
             {
@@ -250,6 +305,7 @@ class Agent:
         # ------------------------------------------------------------------
         # Retrieval
         # ------------------------------------------------------------------
+
         retrieval_query = self._build_retrieval_query(
             session,
             user_message,
@@ -272,6 +328,7 @@ class Agent:
         # ------------------------------------------------------------------
         # Prompt injection detection
         # ------------------------------------------------------------------
+
         injection_flags = flag_injection_patterns(
             user_message,
         )
@@ -288,6 +345,7 @@ class Agent:
         # ------------------------------------------------------------------
         # System instruction
         # ------------------------------------------------------------------
+
         system_instruction = self._build_system_instruction(
             "" if general_question else retrieved_block,
             session.last_order_id,
@@ -310,28 +368,16 @@ class Agent:
         # ------------------------------------------------------------------
         # Deterministic order resolution
         # ------------------------------------------------------------------
-        #
-        # Priority:
-        #
-        # 1. Explicit order ID in the current message.
-        # 2. Previously discussed order ID in this conversation.
-        # 3. Authenticated customer's latest/recent order.
-        #
-        # The LLM does NOT decide which order belongs to the customer.
-        # ------------------------------------------------------------------
 
         detected_order_id = self._extract_order_id(
             user_message,
         )
 
-        # If the customer explicitly provided an order ID, it always wins.
         if detected_order_id is None and self._looks_like_order_question(
             user_message
         ):
             detected_order_id = session.last_order_id
 
-        # If there is no explicit/current-session order ID, detect requests
-        # referring to the customer's latest/recent/last order.
         if (
             detected_order_id is None
             and self._looks_like_latest_order_question(user_message)
@@ -341,6 +387,7 @@ class Agent:
         # ------------------------------------------------------------------
         # Execute deterministic order lookup
         # ------------------------------------------------------------------
+
         tool_start = time.perf_counter()
 
         if detected_order_id:
@@ -385,6 +432,7 @@ class Agent:
         # ------------------------------------------------------------------
         # LLM generation
         # ------------------------------------------------------------------
+
         generation_start = time.perf_counter()
         answer_start = time.perf_counter()
 
@@ -399,29 +447,33 @@ class Agent:
             )
 
         except LLMAvailabilityError as exc:
-            # All configured provider attempts have failed. Never expose the
-            # provider exception to the customer. Return only deterministic,
-            # grounded data and explicitly recommend/create human handoff.
             provider_failover_exhausted = True
+
             try:
                 from app.llm_usage import usage_collector_var
 
                 collector = usage_collector_var.get()
+
                 if collector is not None:
                     collector.failover_exhausted = True
+
             except Exception:
                 pass
+
             logger.error(
                 "LLM failover exhausted after %s attempt(s); models=%s",
                 exc.attempts,
                 exc.attempted_models,
             )
+
             answer = self._fallback_answer(
                 user_message=user_message,
                 tool_call_traces=tool_call_traces,
                 retrieval=retrieval,
             )
+
             answer.handoff_recommended = True
+
             answer.handoff_reason = (
                 "The AI service is temporarily unavailable after "
                 "all configured retry and fallback attempts. "
@@ -429,10 +481,6 @@ class Agent:
             )
 
         except Exception as exc:
-            # Only mask transient provider outages.
-            # Programming/configuration errors should still surface through
-            # the normal 500/error tracker.
-
             status = (
                 getattr(exc, "status_code", None)
                 or getattr(exc, "code", None)
@@ -448,8 +496,6 @@ class Agent:
             }:
                 raise
 
-            # We already have deterministic order data and retrieved policy,
-            # so produce a safe grounded fallback response.
             answer = self._fallback_answer(
                 user_message=user_message,
                 tool_call_traces=tool_call_traces,
@@ -458,17 +504,6 @@ class Agent:
 
         # ------------------------------------------------------------------
         # Deterministic order-data protection
-        # ------------------------------------------------------------------
-        #
-        # A successful authenticated order lookup is authoritative
-        # customer-specific data. Gemini must not be allowed to turn a
-        # successful lookup into an "insufficient information" response just
-        # because RAG returned no relevant documents.
-        #
-        # If Gemini nevertheless returns insufficient_information=True,
-        # replace only that invalid model decision with the existing
-        # deterministic order fallback. The fallback uses ONLY the actual
-        # customer-safe order lookup result.
         # ------------------------------------------------------------------
 
         if (
@@ -485,11 +520,10 @@ class Agent:
 
             answer = deterministic_order_answer
 
-        # General-knowledge fallback: if the model nevertheless follows the
-        # support-domain refusal pattern, make one clean second attempt with
-        # company retrieval context removed. This prevents an irrelevant RAG
-        # result or support-only instruction from turning a question such as
-        # "What is photosynthesis?" into a clarification/handoff response.
+        # ------------------------------------------------------------------
+        # General-knowledge fallback
+        # ------------------------------------------------------------------
+
         if (
             general_question
             and (
@@ -505,22 +539,27 @@ class Agent:
                     [],
                     general_question=True,
                 )
+
                 general_retry_instruction += (
-                    "\n\nFor this retry, you MUST answer the user's general-knowledge "
-                    "question directly. Do not ask for an order number, product, "
-                    "or customer details. If the topic is educational, give a "
-                    "clear concise explanation appropriate for a normal customer."
+                    "\n\nFor this retry, you MUST answer the user's "
+                    "general-knowledge question directly. Do not ask for "
+                    "an order number, product, or customer details. If "
+                    "the topic is educational, give a clear concise "
+                    "explanation appropriate for a normal customer."
                 )
+
                 retry_answer = self._llm.generate_structured_answer(
                     general_retry_instruction,
                     contents,
                 )
+
                 if (
                     retry_answer.answer.strip()
                     and not retry_answer.insufficient_information
                     and not retry_answer.handoff_recommended
                 ):
                     answer = retry_answer
+
             except Exception:
                 logger.exception(
                     "GENERAL_KNOWLEDGE_RETRY_ERROR"
@@ -534,9 +573,14 @@ class Agent:
             time.perf_counter() - generation_start
         ) * 1000
 
+        # Keep the variable intentionally calculated because it is useful
+        # when tracing/debugging generation timing.
+        _ = answer_ms
+
         # ------------------------------------------------------------------
         # Deterministic handoff rules
         # ------------------------------------------------------------------
+
         handoff, handoff_reason = (
             self._apply_deterministic_handoff_rules(
                 model_handoff=answer.handoff_recommended,
@@ -556,6 +600,7 @@ class Agent:
         # ------------------------------------------------------------------
         # Sources
         # ------------------------------------------------------------------
+
         sources = self._resolve_sources(
             answer.cited_document_ids,
             retrieval.authoritative_sources,
@@ -565,6 +610,7 @@ class Agent:
         # ------------------------------------------------------------------
         # Session state
         # ------------------------------------------------------------------
+
         session.add(
             "user",
             user_message,
@@ -579,6 +625,7 @@ class Agent:
         # ------------------------------------------------------------------
         # Timing / trace
         # ------------------------------------------------------------------
+
         total_ms = (
             time.perf_counter() - turn_start
         ) * 1000
@@ -591,27 +638,29 @@ class Agent:
             - generation_ms,
         )
 
-        # Capture request-scoped resilience telemetry without storing provider
-        # secrets or raw exception messages.
         llm_resilience = {}
+
         try:
             from app.llm_usage import usage_collector_var
 
             collector = usage_collector_var.get()
+
             if collector is not None:
                 llm_resilience = {
                     "attempts": collector.attempts,
                     "retry_count": collector.retry_count,
                     "fallback_used": collector.fallback_used,
-                    "fallback_models": list(collector.fallback_models),
+                    "fallback_models": list(
+                        collector.fallback_models
+                    ),
                     "transient_errors": collector.transient_errors,
                     "failover_exhausted": (
                         collector.failover_exhausted
                         or provider_failover_exhausted
                     ),
                 }
+
         except Exception:
-            # Observability must never break a customer response.
             llm_resilience = {
                 "failover_exhausted": provider_failover_exhausted,
             }
@@ -702,8 +751,6 @@ class Agent:
 
         raw = match.group(0)
 
-        # Keep normalization in one place so CLI and DB-backed tools behave
-        # identically.
         from app.orders import normalize_order_id
 
         return normalize_order_id(
@@ -789,40 +836,13 @@ class Agent:
     def _looks_like_latest_order_question(
         text: str,
     ) -> bool:
-        """Detect requests referring to the customer's latest/recent order.
-
-        This intentionally looks for customer-owned temporal references
-        rather than allowing arbitrary language to trigger a global order
-        search.
-
-        Supported languages:
-            - English
-            - Hindi
-            - Spanish
-            - French
-            - German
-
-        Examples:
-            "What is my latest order?"
-            "What's the status of my most recent order?"
-            "Where is my last order?"
-            "Tell me about my recent purchase."
-            "What happened with my newest order?"
-            "My latest order hasn't arrived."
-            "My package hasn't arrived yet."
-            "मेरे नवीनतम ऑर्डर की स्थिति क्या है?"
-            "¿Cuál es el estado de mi último pedido?"
-            "Quel est le statut de ma dernière commande ?"
-            "Wie ist der Status meiner letzten Bestellung?"
-        """
+        """Detect requests referring to the customer's latest/recent order."""
         lowered = " ".join(
             (text or "").lower().split()
         )
 
         latest_phrases = (
-            # --------------------------------------------------------------
             # English
-            # --------------------------------------------------------------
             "latest order",
             "last order",
             "most recent order",
@@ -843,9 +863,7 @@ class Agent:
             "last parcel",
             "most recent parcel",
 
-            # --------------------------------------------------------------
             # Hindi
-            # --------------------------------------------------------------
             "नवीनतम ऑर्डर",
             "नवीनतम आर्डर",
             "आखिरी ऑर्डर",
@@ -868,9 +886,7 @@ class Agent:
             "नवीनतम पार्सल",
             "आखिरी पार्सल",
 
-            # --------------------------------------------------------------
             # Spanish
-            # --------------------------------------------------------------
             "último pedido",
             "ultimo pedido",
             "última orden",
@@ -892,9 +908,7 @@ class Agent:
             "último paquete",
             "ultimo paquete",
 
-            # --------------------------------------------------------------
             # French
-            # --------------------------------------------------------------
             "dernière commande",
             "derniere commande",
             "dernière commande passée",
@@ -910,9 +924,7 @@ class Agent:
             "derniere livraison",
             "dernier colis",
 
-            # --------------------------------------------------------------
             # German
-            # --------------------------------------------------------------
             "letzte bestellung",
             "neueste bestellung",
             "kürzlichste bestellung",
@@ -930,18 +942,6 @@ class Agent:
             for phrase in latest_phrases
         ):
             return True
-
-        # ------------------------------------------------------------------
-        # Natural customer wording for delayed/missing orders.
-        #
-        # Only treat this as latest-order intent when the customer uses
-        # first-person ownership language. This avoids resolving generic
-        # questions such as:
-        #
-        # "How do packages get delivered?"
-        #
-        # into a customer's latest order.
-        # ------------------------------------------------------------------
 
         package_terms = (
             # English
@@ -1084,16 +1084,7 @@ class Agent:
 
     @staticmethod
     def _get_latest_order_id_for_current_user() -> str | None:
-        """Resolve the authenticated customer's newest order.
-
-        The actual user identity comes from `current_user_id_var`, which is
-        populated by `conversation_service.send_message()` before
-        `Agent.handle_turn()` is called.
-
-        This function only returns an order number. The normal
-        `DBOrderLookupTool.lookup()` then performs the final customer-safe
-        lookup.
-        """
+        """Resolve the authenticated customer's newest order."""
         return get_latest_order_for_current_user(
             SessionLocal,
         )
@@ -1106,10 +1097,6 @@ class Agent:
     ) -> bool:
         """Return True when this turn contains a successful customer-safe
         order lookup.
-
-        A successful lookup is authoritative customer-specific data and
-        therefore must not be downgraded to `insufficient_information`
-        simply because the knowledge base returned no documents.
         """
         return any(
             tc.name == "order_lookup"
@@ -1180,8 +1167,16 @@ class Agent:
                 " ",
             )
 
+            # Deterministic wording for shipped/in-transit orders.
+            # The underlying status remains authoritative; this simply makes
+            # the customer-facing fallback explicit that the order has shipped.
+            if status == "in transit":
+                status_text = "has shipped and is currently in transit"
+            else:
+                status_text = f"is currently {status}"
+
             parts = [
-                f"Order {order_id} is currently {status}."
+                f"Order {order_id} {status_text}."
             ]
 
             if data.get("customer_safe_message"):
@@ -1297,8 +1292,6 @@ class Agent:
         if authoritative:
             text = authoritative[0].text
 
-            # Keep provider-outage fallback concise while preserving actual
-            # policy wording supplied by the KB.
             compact = " ".join(
                 text.split()
             )[:700]
@@ -1376,8 +1369,8 @@ class Agent:
 
         if general_question:
             parts.append(
-                "\n\nGENERAL KNOWLEDGE MODE: this request is clearly unrelated to "
-                "Aster & Row. Answer it directly from your general knowledge. "
+                "\n\nGENERAL KNOWLEDGE MODE: this request is clearly unrelated "
+                "to Aster & Row. Answer it directly from your general knowledge. "
                 "Do NOT ask for a product, order number, or customer situation "
                 "just because the Aster & Row knowledge base does not contain "
                 "the topic. Do not claim that company documentation is required."
@@ -1386,9 +1379,10 @@ class Agent:
         if last_order_id:
             parts.append(
                 "\n\nSession context: the most recently discussed order ID "
-                f"in this conversation is {last_order_id}. Reuse it for a "
-                "follow-up question about 'it'/'my order' instead of asking "
-                "again, unless the customer gives a different order ID."
+                "in this conversation is "
+                f"{last_order_id}. Reuse it for a follow-up question about "
+                "'it'/'my order' instead of asking again, unless the customer "
+                "gives a different order ID."
             )
 
         if conflict:
@@ -1419,14 +1413,6 @@ class Agent:
                 "general knowledge."
             )
 
-        # ------------------------------------------------------------------
-        # Important order-data grounding rule.
-        #
-        # The second LLM call receives already-executed order results as
-        # plain content. Explicitly identify that data as authoritative
-        # customer-specific data so the model does not confuse "no RAG hits"
-        # with "no information available".
-        # ------------------------------------------------------------------
         parts.append(
             "\n\nAuthenticated order-data rule:\n"
             "When an authenticated customer order lookup is supplied in the "
@@ -1462,7 +1448,6 @@ class Agent:
             not order_id
             or not str(order_id).strip()
         ):
-            # Deterministic guard: never actually run a lookup with no ID.
             return {
                 "found": False,
                 "error": "missing_order_id",
@@ -1487,8 +1472,6 @@ class Agent:
     ) -> tuple[bool, str | None]:
         """Apply deterministic safety/handoff overrides."""
 
-        # Deterministic overrides can only turn handoff ON, never suppress a
-        # true model recommendation.
         if conflict_detected:
             return (
                 True,
@@ -1540,13 +1523,6 @@ class Agent:
     ) -> list[str]:
         """Build citation footer only from actually retrieved authoritative
         documents.
-
-        `had_tool_call`: when this turn's answer came from a deterministic
-        tool (order/ticket lookup) rather than knowledge-base retrieval, an
-        empty `cited_document_ids` means the answer used NO documents -- it
-        must never fall back to "everything retrieved", since that retrieval
-        was incidental (e.g. run for the quality guard) and unrelated to the
-        tool-derived answer.
         """
 
         valid_files = {
@@ -1561,7 +1537,6 @@ class Agent:
         ]
 
         if cited:
-            # Preserve authoritative_sources order, filtered to cited.
             return [
                 c.source_file
                 for c in authoritative_sources

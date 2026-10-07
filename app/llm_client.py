@@ -1,4 +1,5 @@
 """Wraps the Gemini API calls the agent needs, behind a small interface so
+
 `agent.py` doesn't care whether it's talking to the real API or the offline
 mock used by tests / `evaluation/run_eval.py --mock`.
 
@@ -69,7 +70,7 @@ class ToolDecision:
 class LLMAvailabilityError(RuntimeError):
     """Raised only after all configured provider attempts are exhausted.
 
-    ``status_code=503`` lets the web layer / agent recognize this as a
+    status_code=503 lets the web layer / agent recognize this as a
     temporary provider-availability problem without treating programming,
     authentication, validation, or other non-transient errors as transient.
 
@@ -148,7 +149,9 @@ class GeminiLLMClient:
     # ========================================================
 
     @staticmethod
-    def _status_code_from_exception(exc: Exception) -> int | None:
+    def _status_code_from_exception(
+        exc: Exception,
+    ) -> int | None:
         """Extract a provider HTTP/status code from SDK exceptions.
 
         Different Google SDK versions can expose the status in different
@@ -181,7 +184,10 @@ class GeminiLLMClient:
         return None
 
     @classmethod
-    def _is_transient(cls, exc: Exception) -> bool:
+    def _is_transient(
+        cls,
+        exc: Exception,
+    ) -> bool:
         """Return whether an exception should trigger retry/failover.
 
         Supported retry/failover conditions:
@@ -193,11 +199,6 @@ class GeminiLLMClient:
         - 502: bad gateway
         - 503: service unavailable
         - 504: gateway timeout
-
-        404 is intentionally included because Test 2 deliberately configures
-        an invalid primary model. Gemini can report that condition as a
-        model-not-found HTTP 404. The application should then move to the
-        configured fallback model instead of surfacing the provider error.
 
         Authentication, malformed requests, schema errors, programming
         errors, etc. remain non-transient and are not retried.
@@ -220,7 +221,9 @@ class GeminiLLMClient:
     # ========================================================
 
     @staticmethod
-    def _sleep_before_retry(retry_number: int) -> None:
+    def _sleep_before_retry(
+        retry_number: int,
+    ) -> None:
         delay = min(
             config.LLM_RETRY_MAX_DELAY_SECONDS,
             config.LLM_RETRY_INITIAL_DELAY_SECONDS
@@ -248,7 +251,7 @@ class GeminiLLMClient:
 
             routed model -> primary -> fallback
 
-        ``is_fallback`` is True for models reached after the first selected
+        `is_fallback` is True for models reached after the first selected
         model. This information is used by the usage collector.
         """
 
@@ -268,7 +271,10 @@ class GeminiLLMClient:
 
             if model not in existing_models:
                 candidates.append(
-                    (model, is_fallback)
+                    (
+                        model,
+                        is_fallback,
+                    )
                 )
 
         # First try the model selected by the router/configuration.
@@ -310,24 +316,27 @@ class GeminiLLMClient:
         1. Retry transient 404/408/429/5xx provider failures.
         2. Use bounded exponential backoff.
         3. After one model is exhausted, fail over to the next model.
-        4. Never retry non-transient errors.
-        5. If every configured model is exhausted, raise
-           ``LLMAvailabilityError``.
+        4. A routed model may fail non-transiently and still fall back to
+           the configured primary model.
+        5. The configured primary/fallback models fail fast on non-transient
+           errors.
+        6. If every configured model is exhausted, raise
+           `LLMAvailabilityError`.
 
         AFC contract:
 
         Automatic Function Calling is explicitly disabled for every Gemini
         request when the installed SDK exposes
-        ``AutomaticFunctionCallingConfig``.
+        `AutomaticFunctionCallingConfig`.
 
-        The application executes tools itself. Gemini only returns tool-call
-        decisions.
+        The application executes tools itself. Gemini only returns
+        tool-call decisions.
 
         Test compatibility:
 
-        Some unit tests replace ``google.genai.types`` with a minimal
-        ``SimpleNamespace``. Such test doubles may not expose
-        ``AutomaticFunctionCallingConfig``.
+        Some unit tests replace `google.genai.types` with a minimal
+        test double. Such test doubles may not expose
+        `AutomaticFunctionCallingConfig`.
 
         In that situation AFC configuration is omitted rather than causing
         the test itself to fail.
@@ -357,7 +366,7 @@ class GeminiLLMClient:
             request_config_kwargs.setdefault(
                 "automatic_function_calling",
                 afc_config_cls(
-                    disable=True
+                    disable=True,
                 ),
             )
 
@@ -374,6 +383,21 @@ class GeminiLLMClient:
             or self._model
         )
 
+        # A router override is any requested model different from the
+        # configured primary model.
+        #
+        # This distinction is important:
+        #
+        #     routed model fails
+        #          -> configured primary
+        #
+        # while:
+        #
+        #     configured primary fails with a non-transient error
+        #          -> fail immediately
+        #
+        is_routed_request = requested != self._model
+
         collector = usage_collector_var.get()
 
         attempted_models: list[str] = []
@@ -381,7 +405,7 @@ class GeminiLLMClient:
         last_error: Exception | None = None
 
         model_chain = self._model_chain(
-            requested
+            requested,
         )
 
         # ----------------------------------------------------
@@ -434,17 +458,62 @@ class GeminiLLMClient:
 
                     status = (
                         self._status_code_from_exception(
-                            exc
+                            exc,
                         )
                     )
 
                     # ----------------------------------------
-                    # Non-transient error:
-                    # fail immediately, no retry/failover.
+                    # Non-transient error.
+                    #
+                    # Normally a non-transient error should fail
+                    # immediately.
+                    #
+                    # EXCEPTION:
+                    #
+                    # A model selected by the router is an
+                    # optimization, not a hard dependency.
+                    #
+                    # If that routed model fails, continue to the
+                    # configured primary model.
+                    #
+                    # This gives us:
+                    #
+                    # routed model
+                    #       ↓ failure
+                    # configured primary
+                    #       ↓ failure
+                    # configured fallback
                     # ----------------------------------------
 
                     if not self._is_transient(exc):
+
+                        if (
+                            is_routed_request
+                            and model == requested
+                            and requested != self._model
+                        ):
+                            logger.warning(
+                                "Non-transient routed LLM failure; "
+                                "falling back to configured primary "
+                                "model=%s configured_model=%s "
+                                "status=%s error=%s",
+                                model,
+                                self._model,
+                                status,
+                                type(exc).__name__,
+                            )
+
+                            # Stop retrying this routed model and move
+                            # directly to the next model in the chain.
+                            break
+
+                        # Non-transient failure on the configured model:
+                        # preserve fail-fast behavior.
                         raise
+
+                    # ----------------------------------------
+                    # Transient error.
+                    # ----------------------------------------
 
                     if collector is not None:
                         collector.transient_errors += 1
@@ -467,11 +536,11 @@ class GeminiLLMClient:
 
                     if attempt < config.LLM_MAX_ATTEMPTS_PER_MODEL:
                         self._sleep_before_retry(
-                            attempt
+                            attempt,
                         )
 
             # ------------------------------------------------
-            # Current model exhausted.
+            # Current model exhausted or intentionally skipped.
             # ------------------------------------------------
 
             if index < len(model_chain) - 1:
@@ -505,7 +574,7 @@ class GeminiLLMClient:
     ):
         """Convert internal conversation contents to Gemini Content objects.
 
-        Gemini Content.role accepts ``user`` or ``model``.
+        Gemini Content.role accepts `user` or `model`.
 
         Internal application roles such as:
 
@@ -556,7 +625,7 @@ class GeminiLLMClient:
     ) -> ToolDecision:
         """Ask Gemini whether an application-side tool should be called.
 
-        AFC is centrally disabled inside ``_generate_content``.
+        AFC is centrally disabled inside `_generate_content`.
 
         Gemini only decides whether a tool call should be made. The
         application executes the returned ToolCallRequest.
@@ -615,7 +684,7 @@ class GeminiLLMClient:
     ) -> AgentAnswer:
         """Generate the final structured AgentAnswer.
 
-        AFC is centrally disabled by ``_generate_content``.
+        AFC is centrally disabled by `_generate_content`.
 
         This call does not provide tools and relies on the AgentAnswer
         response schema.
@@ -633,10 +702,16 @@ class GeminiLLMClient:
             },
         )
 
-        # Newer Google GenAI SDKs may populate ``parsed`` when a schema is
+        # Newer Google GenAI SDKs may populate `parsed` when a schema is
         # supplied. Prefer that path when available.
-        if response.parsed is not None:
-            return response.parsed
+        parsed = getattr(
+            response,
+            "parsed",
+            None,
+        )
+
+        if parsed is not None:
+            return parsed
 
         # Fallback for SDK responses where only text is available.
         return AgentAnswer.model_validate(
@@ -664,7 +739,7 @@ class MockLLMClient:
     """
 
     _ORDER_ID_RE = re.compile(
-        r"ORD-?\s?\d{3,5}",
+        r"ORD-?\s?\d{3,9}",
         re.IGNORECASE,
     )
 
@@ -682,15 +757,15 @@ class MockLLMClient:
             "",
         )
 
-        m = self._ORDER_ID_RE.search(
+        match = self._ORDER_ID_RE.search(
             last_user
         )
 
         wants_order = (
-            bool(m)
+            bool(match)
             or any(
-                kw in last_user.lower()
-                for kw in [
+                keyword in last_user.lower()
+                for keyword in [
                     "order",
                     "arrive",
                     "ship",
@@ -701,20 +776,20 @@ class MockLLMClient:
             )
         )
 
-        if not m:
-            for t in reversed(contents):
-                m = self._ORDER_ID_RE.search(
-                    t["text"]
+        if not match:
+            for turn in reversed(contents):
+                match = self._ORDER_ID_RE.search(
+                    turn["text"]
                 )
 
-                if m:
+                if match:
                     break
 
-        if wants_order and m:
+        if wants_order and match:
             order_id = re.sub(
                 r"\s",
                 "",
-                m.group(0),
+                match.group(0),
             ).upper()
 
             return ToolDecision(
@@ -722,7 +797,7 @@ class MockLLMClient:
                     ToolCallRequest(
                         name="order_lookup",
                         arguments={
-                            "order_id": order_id
+                            "order_id": order_id,
                         },
                     )
                 ],
@@ -749,11 +824,14 @@ class MockLLMClient:
             (
                 t["text"]
                 for t in contents
-                if t.get("role")
-                == "system_context"
+                if t.get("role") == "system_context"
             ),
             "",
         )
+
+        # ----------------------------------------------------
+        # Order not found
+        # ----------------------------------------------------
 
         if (
             tool_text
@@ -775,7 +853,16 @@ class MockLLMClient:
                 handoff_reason="Order not found.",
             )
 
+        # ----------------------------------------------------
+        # Order found
+        # ----------------------------------------------------
+
         if tool_text:
+            exception_status = (
+                '"status": "exception"'
+                in tool_text
+            )
+
             return AgentAnswer(
                 answer=(
                     f"Here's what I found: "
@@ -783,17 +870,17 @@ class MockLLMClient:
                 ),
                 cited_document_ids=[],
                 insufficient_information=False,
-                handoff_recommended=(
-                    '"status": "exception"'
-                    in tool_text
-                ),
+                handoff_recommended=exception_status,
                 handoff_reason=(
                     "Order requires support review."
-                    if '"status": "exception"'
-                    in tool_text
+                    if exception_status
                     else None
                 ),
             )
+
+        # ----------------------------------------------------
+        # No retrieval context
+        # ----------------------------------------------------
 
         if not retrieved_block.strip():
             return AgentAnswer(
@@ -811,8 +898,12 @@ class MockLLMClient:
                 ),
             )
 
+        # ----------------------------------------------------
+        # Extract source file IDs from retrieval context.
+        # ----------------------------------------------------
+
         doc_ids = re.findall(
-            r"\*\*\[source_file:\s\*([\w\.-]+)\*\*\]",
+            r"\[source_file:\s*([\w.-]+)\]",
             retrieved_block,
         )
 

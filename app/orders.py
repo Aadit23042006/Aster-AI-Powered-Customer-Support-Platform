@@ -5,6 +5,7 @@ model never sees that file -- it only ever sees the dict returned by
 `OrderLookupTool.lookup()`, which is already field-filtered and status-aware
 per the rules in `data/orders-data-dictionary.md`.
 """
+
 from __future__ import annotations
 
 import json
@@ -32,6 +33,7 @@ _SAFE_TOP_LEVEL_FIELDS = {
     "estimated_delivery",
     "customer_safe_message",
 }
+
 _SAFE_ITEM_FIELDS = {"name", "quantity", "final_sale"}
 
 # Statuses where a stale estimated_delivery/carrier field must not be read
@@ -50,46 +52,80 @@ class OrderLookupResult:
     error: str | None = None  # "not_found" | "malformed"
 
     def to_tool_response(self) -> dict[str, Any]:
-        """What actually gets logged/passed back to the model. Never includes
-        anything outside the safe-field allowlist."""
+        """What actually gets logged/passed back to the model.
+
+        Never includes anything outside the safe-field allowlist.
+        """
         if not self.found:
-            return {"found": False, "order_id_queried": self.order_id_queried, "error": self.error}
-        return {"found": True, "order_id_queried": self.order_id_queried, **self.data}
+            return {
+                "found": False,
+                "order_id_queried": self.order_id_queried,
+                "error": self.error,
+            }
+
+        return {
+            "found": True,
+            "order_id_queried": self.order_id_queried,
+            **self.data,
+        }
 
 
 def normalize_order_id(raw: str) -> str:
-    """Uppercase + strip whitespace/punctuation the dictionary calls
-    'harmless input differences' -- e.g. 'ord 1007' -> 'ORD-1007'.
+    """Normalize harmless variations of an order ID.
 
-    Also tolerates two conversational forms found through manual testing
-    (bug diary entry #3 in the README): the word "order" plus a bare number
-    ("order 1007", "order# 1007" both clean to ORDER1007 after punctuation
-    stripping), and a bare number by itself ("1007", "#1007"). Does NOT
-    guess a substantially different ID -- non-numeric, non-order-shaped
-    input is left alone and will simply fail to match any order, which is
-    the desired "don't invent a match" behaviour."""
+    Examples:
+        'ord 1007'   -> 'ORD-1007'
+        'order 1007' -> 'ORD-1007'
+        'order# 1007' -> 'ORD-1007'
+        '1007'       -> 'ORD-1007'
+        '#1007'      -> 'ORD-1007'
+
+    Does NOT guess a substantially different ID. Non-numeric,
+    non-order-shaped input is left alone and will simply fail validation,
+    which is the desired "don't invent a match" behaviour.
+    """
     cleaned = raw.strip().upper()
     cleaned = re.sub(r"[^A-Z0-9-]", "", cleaned)
 
-    m = re.match(r"^ORD-?(\d+)$", cleaned)
-    if m:
-        return f"ORD-{m.group(1)}"
+    match = re.match(r"^ORD-?(\d+)$", cleaned)
+    if match:
+        return f"ORD-{match.group(1)}"
 
-    m = re.match(r"^ORDER-?(\d+)$", cleaned)
-    if m:
-        return f"ORD-{m.group(1)}"
+    match = re.match(r"^ORDER-?(\d+)$", cleaned)
+    if match:
+        return f"ORD-{match.group(1)}"
 
-    m = re.match(r"^(\d{3,6})$", cleaned)
-    if m:
-        return f"ORD-{m.group(1)}"
+    match = re.match(r"^(\d{3,6})$", cleaned)
+    if match:
+        return f"ORD-{match.group(1)}"
 
     return cleaned
 
 
 def _filter_order(order: dict[str, Any]) -> dict[str, Any]:
-    safe = {k: v for k, v in order.items() if k in _SAFE_TOP_LEVEL_FIELDS}
+    """Return only customer-safe fields from an order."""
+
+    safe = {
+        key: value
+        for key, value in order.items()
+        if key in _SAFE_TOP_LEVEL_FIELDS
+    }
+
+    items = order.get("items", [])
+
+    # Be defensive about malformed item data. Only dictionaries can be
+    # safely field-filtered.
+    if not isinstance(items, list):
+        items = []
+
     safe["items"] = [
-        {k: v for k, v in item.items() if k in _SAFE_ITEM_FIELDS} for item in order.get("items", [])
+        {
+            key: value
+            for key, value in item.items()
+            if key in _SAFE_ITEM_FIELDS
+        }
+        for item in items
+        if isinstance(item, dict)
     ]
 
     # Status precedence: status is authoritative. Never let a stale
@@ -105,22 +141,90 @@ def _filter_order(order: dict[str, Any]) -> dict[str, Any]:
 class OrderLookupTool:
     def __init__(self, orders_path: Path = config.ORDERS_PATH):
         payload = json.loads(orders_path.read_text(encoding="utf-8"))
-        self.snapshot_at = payload.get("snapshot_at")
-        self._by_id: dict[str, dict[str, Any]] = {o["order_id"]: o for o in payload["orders"]}
+
+        # `data/orders.json` has existed in two supported shapes:
+        #
+        # 1. Wrapped format:
+        #    {
+        #        "snapshot_at": "...",
+        #        "orders": [...]
+        #    }
+        #
+        # 2. Legacy/simple format:
+        #    [
+        #        {...},
+        #        {...}
+        #    ]
+        #
+        # Support both formats so tests and existing data files continue
+        # to work without requiring a data migration.
+        if isinstance(payload, dict):
+            self.snapshot_at = payload.get("snapshot_at")
+            orders = payload.get("orders", [])
+        elif isinstance(payload, list):
+            self.snapshot_at = None
+            orders = payload
+        else:
+            raise ValueError(
+                "Invalid orders.json format: expected an object containing "
+                "'orders' or a top-level list of orders."
+            )
+
+        if not isinstance(orders, list):
+            raise ValueError(
+                "Invalid orders.json format: 'orders' must be a list."
+            )
+
+        # Keep only valid order dictionaries with a usable order_id.
+        # This prevents malformed records from breaking tool initialization.
+        self._by_id: dict[str, dict[str, Any]] = {}
+
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+
+            order_id = order.get("order_id")
+            if not isinstance(order_id, str):
+                continue
+
+            normalized_order_id = normalize_order_id(order_id)
+
+            if not _ORDER_ID_RE.match(normalized_order_id):
+                continue
+
+            self._by_id[normalized_order_id] = order
 
     def lookup(self, raw_order_id: str) -> OrderLookupResult:
         if not raw_order_id or not raw_order_id.strip():
-            return OrderLookupResult(found=False, order_id_queried=raw_order_id, error="malformed")
+            return OrderLookupResult(
+                found=False,
+                order_id_queried=raw_order_id,
+                error="malformed",
+            )
 
         normalized = normalize_order_id(raw_order_id)
+
         if not _ORDER_ID_RE.match(normalized):
-            return OrderLookupResult(found=False, order_id_queried=raw_order_id, error="malformed")
+            return OrderLookupResult(
+                found=False,
+                order_id_queried=raw_order_id,
+                error="malformed",
+            )
 
         order = self._by_id.get(normalized)
-        if order is None:
-            return OrderLookupResult(found=False, order_id_queried=normalized, error="not_found")
 
-        return OrderLookupResult(found=True, order_id_queried=normalized, data=_filter_order(order))
+        if order is None:
+            return OrderLookupResult(
+                found=False,
+                order_id_queried=normalized,
+                error="not_found",
+            )
+
+        return OrderLookupResult(
+            found=True,
+            order_id_queried=normalized,
+            data=_filter_order(order),
+        )
 
 
 ORDER_LOOKUP_TOOL_SCHEMA = {
@@ -137,7 +241,10 @@ ORDER_LOOKUP_TOOL_SCHEMA = {
         "properties": {
             "order_id": {
                 "type": "STRING",
-                "description": "The order ID as given by the customer, e.g. 'ORD-1007'.",
+                "description": (
+                    "The order ID as given by the customer, "
+                    "e.g. 'ORD-1007'."
+                ),
             }
         },
         "required": ["order_id"],

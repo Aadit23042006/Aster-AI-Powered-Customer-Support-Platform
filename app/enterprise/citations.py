@@ -35,9 +35,22 @@ def build_citations(
     retrieval,
     only_files: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build citation records from the actual scored RAG retrieval hits.
+    """Build safe customer-facing citation records.
 
-    The citation pipeline preserves:
+    Supports both:
+
+    1. Scored RetrievalHit objects in ``retrieval.hits``.
+       These preserve retrieval relevance scores.
+
+    2. Bare Chunk objects in
+       ``retrieval.authoritative_sources``.
+       These are supported when a RetrievalResult does not contain
+       scored hits.
+
+    ``authoritative_sources`` is treated as the customer-facing
+    allow-list whenever it is present.
+
+    The resulting citation preserves:
 
     - source document
     - chunk/document IDs
@@ -45,25 +58,7 @@ def build_citations(
     - retrieved passage
     - document version
     - updated/published/reviewed timestamp
-    - retrieval relevance score
-
-    RetrievalResult.authoritative_sources contains bare Chunk objects,
-    which do not contain the RetrievalHit.score. Therefore this function
-    primarily iterates over retrieval.hits so that both Chunk metadata
-    and RetrievalHit.score remain available.
-
-    Supported metadata:
-
-    Admin-authored KB:
-        document_version
-        version
-        updated_at
-        published_at
-
-    Original Markdown KB:
-        document_id
-        last_reviewed
-        effective_date
+    - retrieval relevance score when available
     """
 
     if retrieval is None:
@@ -76,18 +71,33 @@ def build_citations(
     )
 
     # ------------------------------------------------------------------
-    # Actual scored retrieval hits.
+    # Retrieval hits.
     #
-    # RetrievedChunk:
-    #   chunk: Chunk
-    #   score: float
+    # These are preferred because they can contain an actual retrieval
+    # relevance score.
     # ------------------------------------------------------------------
     hits = list(
-        getattr(retrieval, "hits", None) or []
+        getattr(
+            retrieval,
+            "hits",
+            None,
+        )
+        or []
     )
 
-    if not hits:
-        return []
+    # ------------------------------------------------------------------
+    # Authoritative customer-facing sources.
+    #
+    # These may be bare Chunk objects or RetrievalHit-like objects.
+    # ------------------------------------------------------------------
+    authoritative_sources = list(
+        getattr(
+            retrieval,
+            "authoritative_sources",
+            None,
+        )
+        or []
+    )
 
     # ------------------------------------------------------------------
     # Build score lookups as a defensive fallback.
@@ -134,21 +144,8 @@ def build_citations(
         score_by_file_heading[file_heading] = score
 
     # ------------------------------------------------------------------
-    # Build a set of authoritative source files.
-    #
-    # We still respect RetrievalResult.authoritative_sources so that
-    # inactive/non-official/non-customer-facing chunks cannot become
-    # customer citations.
+    # Build authoritative allow-lists.
     # ------------------------------------------------------------------
-    authoritative_sources = list(
-        getattr(
-            retrieval,
-            "authoritative_sources",
-            None,
-        )
-        or []
-    )
-
     authoritative_keys: set[
         tuple[str, str, str]
     ] = set()
@@ -175,32 +172,33 @@ def build_citations(
             _chunk_key(chunk)
         )
 
-    # ------------------------------------------------------------------
-    # If authoritative_sources is unavailable/empty, retain compatibility
-    # with older RetrievalResult implementations.
-    # ------------------------------------------------------------------
     use_authoritative_filter = bool(
         authoritative_sources
     )
+
+    # ------------------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Normally iterate over scored RetrievalHit objects.
+    #
+    # If there are no scored hits, fall back to authoritative_sources.
+    #
+    # This is required for callers/tests that provide bare authoritative
+    # Chunk objects without constructing RetrievalHit instances.
+    # ------------------------------------------------------------------
+    if hits:
+        source_items = hits
+    elif authoritative_sources:
+        source_items = authoritative_sources
+    else:
+        return []
 
     out: list[dict[str, Any]] = []
 
     seen: set[str] = set()
 
-    # ------------------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Iterate over the REAL RetrievalHit objects.
-    #
-    # This preserves:
-    #
-    #   hit.chunk.metadata
-    #   hit.score
-    #
-    # instead of converting the hit to a bare Chunk first.
-    # ------------------------------------------------------------------
-    for hit in hits:
-        chunk = _chunk_of(hit)
+    for item in source_items:
+        chunk = _chunk_of(item)
 
         source_file = str(
             getattr(
@@ -214,7 +212,9 @@ def build_citations(
         if not source_file:
             continue
 
+        # --------------------------------------------------------------
         # Respect an explicit file filter.
+        # --------------------------------------------------------------
         if (
             allowed is not None
             and source_file not in allowed
@@ -233,7 +233,8 @@ def build_citations(
             ):
                 continue
         else:
-            # Defensive fallback for older retrieval implementations.
+            # Defensive fallback for retrieval implementations that do
+            # not expose authoritative_sources.
             if not (
                 getattr(
                     chunk,
@@ -303,9 +304,6 @@ def build_citations(
         #
         # Original Markdown:
         #   document_id
-        #
-        # document_id is used as a stable source revision identifier
-        # when no explicit version exists.
         # --------------------------------------------------------------
         document_version = (
             metadata.get(
@@ -331,14 +329,6 @@ def build_citations(
 
         # --------------------------------------------------------------
         # Updated timestamp.
-        #
-        # Admin KB:
-        #   updated_at
-        #   published_at
-        #
-        # Original Markdown:
-        #   last_reviewed
-        #   effective_date
         # --------------------------------------------------------------
         updated_at = (
             metadata.get(
@@ -363,16 +353,19 @@ def build_citations(
         # --------------------------------------------------------------
         # Retrieval relevance.
         #
-        # PRIMARY:
+        # Primary:
         #   actual RetrievalHit.score
         #
-        # FALLBACK:
+        # Fallback:
         #   score lookup by chunk identity
         #
-        # FALLBACK:
+        # Fallback:
         #   source_file + heading
+        #
+        # Bare authoritative Chunks naturally have no score, so their
+        # relevance_score remains None.
         # --------------------------------------------------------------
-        relevance_score = _score_of(hit)
+        relevance_score = _score_of(item)
 
         if relevance_score is None:
             relevance_score = score_by_key.get(
@@ -390,7 +383,7 @@ def build_citations(
             )
 
         # --------------------------------------------------------------
-        # Passage.
+        # Customer-facing passage.
         # --------------------------------------------------------------
         passage = text[:1200]
 

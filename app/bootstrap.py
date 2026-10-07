@@ -17,14 +17,12 @@ from app.session import SessionStore
 def build_agent(use_mock_llm: bool | None = None) -> Agent:
     """Build and return the application Agent.
 
-    The same wiring is used by the CLI, FastAPI server, and evaluation
-    harness.
+    Mock/evaluation mode uses the JSON-backed OrderLookupTool because the
+    standalone evaluation harness does not have an authenticated user
+    context.
 
-    Important:
-    - RAG uses the configured embedding provider.
-    - Order lookups use the authenticated customer's PostgreSQL data.
-    - DBOrderLookupTool enforces user ownership through the
-      current_user_id_var context set by conversation_service.
+    Real application mode uses DBOrderLookupTool, which enforces
+    authenticated-user ownership against PostgreSQL.
     """
 
     if use_mock_llm is None:
@@ -38,13 +36,10 @@ def build_agent(use_mock_llm: bool | None = None) -> Agent:
 
         embedder = FakeEmbedder()
 
-        # Fake embeddings are deterministic/offline and are not worth
-        # persisting as a production cache.
         index = build_index(
             embedder,
             force=True,
         )
-
     else:
         if not config.GEMINI_API_KEY:
             raise RuntimeError(
@@ -57,8 +52,6 @@ def build_agent(use_mock_llm: bool | None = None) -> Agent:
 
         embedder = GeminiEmbedder()
 
-        # Uses the configured Gemini embedding model/dimension and the
-        # existing index cache when available.
         index = build_index(embedder)
 
     retriever = Retriever(
@@ -67,25 +60,30 @@ def build_agent(use_mock_llm: bool | None = None) -> Agent:
     )
 
     # ------------------------------------------------------------------
-    # Database-backed customer order lookup
+    # Order lookup
     # ------------------------------------------------------------------
     #
-    # IMPORTANT:
-    # Do NOT use the legacy:
+    # Mock/evaluation mode:
+    #   Use the JSON-backed OrderLookupTool.
     #
-    #     OrderLookupTool()
+    # The standalone evaluation harness calls Agent.handle_turn() directly
+    # and therefore has no authenticated current_user_id_var context.
+    # DBOrderLookupTool would consequently reject every order lookup.
     #
-    # because that tool reads the old JSON-backed order data.
+    # Real application mode:
+    #   Use DBOrderLookupTool with PostgreSQL.
     #
-    # DBOrderLookupTool uses PostgreSQL and applies authenticated-user
-    # ownership filtering through current_user_id_var.
+    # FastAPI conversation_service establishes the authenticated user
+    # context before Agent.handle_turn() executes.
     #
-    # conversation_service.send_message() sets that context before
-    # Agent.handle_turn() executes.
-    #
-    orders = DBOrderLookupTool(
-        SessionLocal,
-    )
+    if use_mock_llm:
+        from app.orders import OrderLookupTool
+
+        orders = OrderLookupTool()
+    else:
+        orders = DBOrderLookupTool(
+            SessionLocal,
+        )
 
     # ------------------------------------------------------------------
     # LLM client
@@ -94,7 +92,6 @@ def build_agent(use_mock_llm: bool | None = None) -> Agent:
         from app.llm_client import MockLLMClient
 
         llm_client = MockLLMClient()
-
     else:
         from app.llm_client import GeminiLLMClient
 

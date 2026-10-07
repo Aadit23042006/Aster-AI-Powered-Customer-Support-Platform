@@ -1,4 +1,4 @@
-"""Admin-only routes for Phase 3: audit log viewing (Feature 21) and
+﻿"""Admin-only routes for Phase 3: audit log viewing (Feature 21) and
 user/role management (Feature 19). Gated by the new fine-grained
 `require_permission` dependency, not the coarser `require_roles` used by
 Phase 1/2 admin routes -- see `app/auth/permissions.py` for why these are
@@ -158,7 +158,7 @@ def delete_user(
     # Core Aster & Row accounts are protected from permanent deletion. This is
     # enforced server-side so hiding/disabling the button in the UI can never
     # be bypassed with a direct API request.
-    protected_roles = {"customer", "support_agent", "admin", "super_admin"}
+    protected_roles = {"support_agent", "admin", "super_admin"}
     if target_roles & protected_roles:
         raise HTTPException(
             status_code=403,
@@ -223,3 +223,4 @@ def list_errors(
     page_size = min(max(page_size, 1), 100)
     rows = query.offset((page - 1) * page_size).limit(page_size).all()
     return PaginatedErrorEvents(items=[ErrorEventOut.model_validate(e) for e in rows], total=total, page=page, page_size=page_size)
+

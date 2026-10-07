@@ -19,6 +19,7 @@ The database-backed tool:
   merely to record an audit entry;
 - never allows Action Center auditing to break a valid order lookup.
 """
+
 from __future__ import annotations
 
 import contextvars
@@ -156,8 +157,7 @@ def _lookup_action_idempotency_key(
 
     We do not call `action_center.execute()` here because that method applies
     the staff-facing `orders.read` permission check. A customer is allowed to
-    access their OWN order without having the staff-level `orders.read`
-    permission.
+    access their OWN order without having that staff-level permission.
 
     The actual order lookup has already enforced ownership at the database
     query level, so this function only creates the audit identity.
@@ -391,9 +391,24 @@ class DBOrderLookupTool:
         # ---------------------------------------------------------------
         user_id = current_user_id_var.get()
 
+        # TEMPORARY DIAGNOSTIC:
+        # This confirms whether the authenticated user context reaches the
+        # database-backed AI order lookup.
+        logger.warning(
+            "[DEBUG ORDER LOOKUP] user_id=%r order_id=%r",
+            user_id,
+            normalized,
+        )
+
         # An AI order lookup without an authenticated user MUST NOT fall
         # back to a global order search.
         if user_id is None:
+            logger.warning(
+                "[DEBUG ORDER LOOKUP] user_id is None; "
+                "returning not_found for order_id=%r",
+                normalized,
+            )
+
             return OrderLookupResult(
                 found=False,
                 order_id_queried=normalized,
@@ -423,6 +438,17 @@ class DBOrderLookupTool:
                     Order.user_id == user_id,
                 )
                 .first()
+            )
+
+            # TEMPORARY DIAGNOSTIC:
+            # This confirms whether the database query itself finds the
+            # authenticated customer's order.
+            logger.warning(
+                "[DEBUG ORDER LOOKUP] order_found=%s "
+                "user_id=%r order_id=%r",
+                order is not None,
+                user_id,
+                normalized,
             )
 
             # -----------------------------------------------------------

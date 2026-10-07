@@ -456,7 +456,20 @@ def test_quality_guard_retry_wider_retrieval(
         question=None,
         evidence=None,
         retrieval_score=None,
+        allow_general_knowledge=False,
+        **kwargs,
     ):
+        """Deterministic Quality Guard mock.
+
+        The production `assess()` function currently accepts
+        `allow_general_knowledge`. Keep this mock compatible with that
+        interface so the test exercises the real retry path instead of
+        failing because of a stale mock signature.
+
+        `**kwargs` also keeps this test resilient to future optional
+        Quality Guard keyword arguments.
+        """
+
         quality_calls.append(
             {
                 "answer": answer,
@@ -466,6 +479,10 @@ def test_quality_guard_retry_wider_retrieval(
                 "question": question,
                 "evidence": list(evidence or []),
                 "retrieval_score": retrieval_score,
+                "allow_general_knowledge": (
+                    allow_general_knowledge
+                ),
+                "extra_kwargs": kwargs,
             }
         )
 
@@ -582,6 +599,19 @@ def test_quality_guard_retry_wider_retrieval(
     assert (
         quality_calls[0]["question"]
         == "How do I check my order status?"
+    )
+
+    # The production service now passes this argument.
+    # Verify that the mock received it without imposing a
+    # particular value on the application's policy.
+    assert isinstance(
+        quality_calls[0]["allow_general_knowledge"],
+        bool,
+    )
+
+    assert isinstance(
+        quality_calls[1]["allow_general_knowledge"],
+        bool,
     )
 
     # ---------------------------------------------------------

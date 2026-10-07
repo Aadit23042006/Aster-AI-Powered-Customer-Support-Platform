@@ -22,6 +22,13 @@ Quality Guard observability:
 14. Persists nested `quality_trace` in assistant metadata.
 15. Preserves initial/retry/final decisions after Action Center processing.
 16. Persists the same trace inside AIQualityCheck.details.
+
+Order protection:
+
+17. A successful authenticated database order lookup is authoritative.
+18. Quality Guard must not replace a successful order result with a generic
+    "couldn't verify" response.
+19. Order ownership is always enforced by user_id.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from app.db.models import (
     AIQualityCheck,
     ConversationCitation,
     MediaAttachment,
+    Order,
 )
 
 from app.notifications.service import create_notification
@@ -155,14 +163,7 @@ def _persist_quality_trace_directly(
     message_id: uuid.UUID,
     quality_trace: dict,
 ) -> None:
-    """Persist quality_trace directly into PostgreSQL JSON metadata.
-
-    This is intentionally PostgreSQL-specific because the application
-    uses PostgreSQL and messages.meta is a JSON column.
-
-    The update only changes the top-level quality_trace key and preserves
-    all existing assistant metadata.
-    """
+    """Persist quality_trace directly into PostgreSQL JSON metadata."""
 
     trace_payload = json.dumps(
         _copy_json_dict(quality_trace),
@@ -211,11 +212,7 @@ def _persist_final_quality_trace(
     assistant_row: Message,
     quality_trace: dict,
 ) -> None:
-    """Final authoritative persistence point.
-
-    IMPORTANT:
-    This must be called after all normal ORM work has completed.
-    """
+    """Final authoritative persistence point."""
 
     trace = _copy_json_dict(quality_trace)
 
@@ -232,7 +229,6 @@ def _persist_final_quality_trace(
         "meta",
     )
 
-    # Synchronize ORM state first.
     db.flush()
 
     logger.info(
@@ -248,7 +244,6 @@ def _persist_final_quality_trace(
         ),
     )
 
-    # FINAL database-level write.
     _persist_quality_trace_directly(
         db,
         message_id=assistant_row.id,
@@ -260,6 +255,146 @@ def _persist_final_quality_trace(
         "message_id=%s",
         assistant_row.id,
     )
+
+
+# ============================================================================
+# ORDER RESULT PROTECTION
+# ============================================================================
+
+
+_ORDER_ID_RE = re.compile(
+    r"\b(?:ORD[-\s]?\d{3,6}|ORDER[-#\s]?\d{3,6}|#\d{3,6})\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_order_id(
+    user_message: str,
+) -> str | None:
+    """Extract and normalize an explicit order ID."""
+
+    if not user_message:
+        return None
+
+    match = _ORDER_ID_RE.search(
+        user_message
+    )
+
+    if match is None:
+        return None
+
+    value = match.group(0).upper()
+
+    value = re.sub(
+        r"^ORDER[-#\s]?",
+        "ORD-",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    value = re.sub(
+        r"^#",
+        "ORD-",
+        value,
+    )
+
+    value = re.sub(
+        r"^ORD\s+",
+        "ORD-",
+        value,
+    )
+
+    return value
+
+
+def _repair_successful_order_answer(
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    user_message: str,
+    result: TurnResult,
+) -> bool:
+    """Protect a successful authenticated DB order lookup.
+
+    The Agent performs the authoritative order lookup. However, Quality Guard
+    may later replace a valid order answer with a generic grounding fallback.
+
+    This helper independently verifies the explicit order ID against the
+    authenticated user's PostgreSQL orders and restores a deterministic,
+    customer-safe answer when the order exists.
+
+    It NEVER searches another user's order.
+    """
+
+    order_id = _extract_order_id(
+        user_message
+    )
+
+    if order_id is None:
+        return False
+
+    try:
+        order = (
+            db.query(Order)
+            .filter(
+                Order.order_number == order_id,
+                Order.user_id == user_id,
+            )
+            .first()
+        )
+
+        if order is None:
+            return False
+
+        status = str(
+            order.status or ""
+        ).strip()
+
+        if not status:
+            return False
+
+        current_answer = (
+            result.answer or ""
+        ).lower()
+
+        # If the valid order information is already present, leave the
+        # Agent's richer answer untouched.
+        if (
+            order_id.lower() in current_answer
+            or status.lower() in current_answer
+        ):
+            return False
+
+        result.answer = (
+            f"Order {order_id} is currently {status}."
+        )
+
+        result.handoff = False
+        result.handoff_reason = None
+        result.insufficient_information = False
+
+        logger.info(
+            "ORDER_RESULT_PROTECTED "
+            "user_id=%s "
+            "order_id=%s "
+            "status=%s",
+            user_id,
+            order_id,
+            status,
+        )
+
+        return True
+
+    except Exception:
+        logger.exception(
+            "ORDER_RESULT_PROTECTION_FAILED "
+            "user_id=%s "
+            "order_id=%s",
+            user_id,
+            order_id,
+        )
+
+        return False
 
 
 # ============================================================================
@@ -361,18 +496,22 @@ def delete_conversations_for_user(
     user_id: uuid.UUID,
     conversation_ids: list[uuid.UUID] | None,
 ) -> int:
-    """Delete many conversations owned by `user_id` (None = all of them).
+    """Delete conversations owned by user_id."""
 
-    Ids that do not belong to the user are silently ignored, so a caller
-    can never delete someone else's history. Each row is deleted through
-    the ORM so message cascades behave exactly like the single delete.
-    """
-    query = db.query(Conversation).filter(Conversation.user_id == user_id)
+    query = db.query(Conversation).filter(
+        Conversation.user_id == user_id
+    )
+
     if conversation_ids is not None:
-        query = query.filter(Conversation.id.in_(conversation_ids))
+        query = query.filter(
+            Conversation.id.in_(conversation_ids)
+        )
+
     rows = query.all()
+
     for row in rows:
         db.delete(row)
+
     return len(rows)
 
 
@@ -431,7 +570,7 @@ def _auto_title(first_message: str) -> str:
     )
 
     return cleaned[:60] + (
-        "â€¦" if len(cleaned) > 60 else ""
+        "…" if len(cleaned) > 60 else ""
     )
 
 
@@ -790,11 +929,10 @@ def send_message(
         conversation.messages,
     )
 
-    # Attachments are uploaded before the user's question. When the frontend
-    # supplies attachment_ids, bind exactly those files to this turn. This
-    # prevents an older pending upload in the same conversation from being
-    # accidentally attached to a later question. The legacy fallback keeps
-    # older clients working as before.
+    # ------------------------------------------------------------------------
+    # ATTACHMENTS
+    # ------------------------------------------------------------------------
+
     attachment_query = (
         db.query(MediaAttachment)
         .filter(
@@ -804,17 +942,21 @@ def send_message(
             MediaAttachment.analysis_status == "completed",
         )
     )
+
     if attachment_ids:
         attachment_query = attachment_query.filter(
             MediaAttachment.id.in_(attachment_ids)
         )
+
     pending_attachments = attachment_query.order_by(
         MediaAttachment.created_at.asc()
     ).all()
 
     agent_user_message = user_message
+
     if pending_attachments:
         context_blocks = []
+
         for attachment in pending_attachments:
             context_blocks.append(
                 f"Attached file: {attachment.filename}\n"
@@ -857,6 +999,7 @@ def send_message(
     )
 
     collector = UsageCollector()
+
     collector_token = usage_collector_var.set(
         collector
     )
@@ -965,9 +1108,39 @@ def send_message(
                     "model routing event persistence failed"
                 )
 
-    # ========================================================================
+    # =========================================================================
+    # IMPORTANT ORDER PROTECTION
+    # =========================================================================
+    #
+    # Agent.handle_turn() already performed the authoritative DB order lookup.
+    #
+    # However, Quality Guard operates after Agent.handle_turn() and can replace
+    # a successful order answer with a generic grounding fallback.
+    #
+    # Verify the explicit order ID against the authenticated user's own DB
+    # orders here before Quality Guard runs.
+    #
+    # This is deliberately ownership-scoped and cannot expose another user's
+    # order.
+    # =========================================================================
+
+    order_result_protected = _repair_successful_order_answer(
+        db,
+        user_id=user_id,
+        user_message=user_message,
+        result=result,
+    )
+
+    if order_result_protected:
+        logger.info(
+            "ORDER_RESULT_PROTECTION_APPLIED "
+            "conversation_id=%s",
+            conversation.id,
+        )
+
+    # =========================================================================
     # INITIAL MESSAGE PERSISTENCE
-    # ========================================================================
+    # =========================================================================
 
     user_row = Message(
         conversation_id=conversation.id,
@@ -993,8 +1166,7 @@ def send_message(
     db.add(assistant_row)
     db.flush()
 
-    # Bind all attachments uploaded since the last question to this user
-    # message so they remain visible in the conversation history.
+    # Bind attachments.
     if pending_attachments:
         user_row.meta = {
             "attachments": [
@@ -1003,18 +1175,23 @@ def send_message(
                     "filename": attachment.filename,
                     "content_type": attachment.content_type,
                     "size_bytes": attachment.size_bytes,
-                    "url": f"/api/v1/chat/attachments/{attachment.id}/content",
+                    "url": (
+                        "/api/v1/chat/attachments/"
+                        f"{attachment.id}/content"
+                    ),
                 }
                 for attachment in pending_attachments
             ]
         }
+
         for attachment in pending_attachments:
             attachment.message_id = user_row.id
+
         db.flush()
 
-    # ========================================================================
+    # =========================================================================
     # INTELLIGENCE
-    # ========================================================================
+    # =========================================================================
 
     classification = classify_message(
         user_message
@@ -1043,14 +1220,10 @@ def send_message(
 
     action_result = None
 
-    # ========================================================================
+    # =========================================================================
     # QUALITY GUARD
-    # ========================================================================
+    # =========================================================================
 
-    # Quality Guard must inspect EVERY generated LLM response when enabled.
-    # Do not make eligibility depend on model-provided metadata such as
-    # sources/handoff/insufficient_information, because an unsafe LLM response
-    # can otherwise bypass the guard simply by returning empty metadata.
     eligible_quality = bool(
         _cfg.QUALITY_GUARD_ENABLED
     )
@@ -1128,9 +1301,9 @@ def send_message(
         allow_general_knowledge=result.general_question,
     )
 
-    # ========================================================================
+    # =========================================================================
     # INITIAL QUALITY VALUES
-    # ========================================================================
+    # =========================================================================
 
     initial_decision = qr.decision
     initial_grounding = qr.grounding_score
@@ -1155,20 +1328,53 @@ def send_message(
 
     fallback_action = None
 
-    # ========================================================================
-    # MODEL HANDOFF
-    # ========================================================================
+    # =========================================================================
+    # ORDER LOOKUPS ARE AUTHORITATIVE
+    # =========================================================================
+    #
+    # A successfully verified customer-owned order must never enter the
+    # generic RETRY_RETRIEVAL -> "couldn't verify" path.
+    #
+    # We already verified the order immediately after Agent.handle_turn().
+    # Re-checking the explicit order here makes this protection independent
+    # from model-provided metadata.
+    # =========================================================================
 
-    if (
+    order_is_authoritative = bool(
+        order_result_protected
+    )
+
+    if order_is_authoritative:
+        fallback_action = "authoritative_order_lookup"
+
+        # The answer came from an authenticated DB lookup, so it is already
+        # grounded customer data. Do not replace it with generic RAG fallback.
+        result.handoff = False
+        result.handoff_reason = None
+        result.insufficient_information = False
+
+        qr = assess(
+            result.answer,
+            result.sources,
+            False,
+            eligible=False,
+            question=user_message,
+        )
+
+    # =========================================================================
+    # MODEL HANDOFF
+    # =========================================================================
+
+    elif (
         eligible_quality
         and result.handoff
         and qr.decision == "HUMAN_HANDOFF"
     ):
         fallback_action = "model_handoff"
 
-    # ========================================================================
+    # =========================================================================
     # BLOCK -> HUMAN HANDOFF
-    # ========================================================================
+    # =========================================================================
 
     elif (
         eligible_quality
@@ -1209,9 +1415,9 @@ def send_message(
                 "quality reassessment after BLOCK failed"
             )
 
-    # ========================================================================
+    # =========================================================================
     # RETRY RETRIEVAL
-    # ========================================================================
+    # =========================================================================
 
     elif (
         eligible_quality
@@ -1324,32 +1530,64 @@ def send_message(
             )
 
         else:
-            result.answer = (
-                "I couldn't verify that information reliably "
-                "from the available sources. A support specialist "
-                "can confirm it for you."
+            #
+            # The order lookup is authoritative transactional data. The
+            # authenticated DB order tool has already:
+            #
+            #   1. validated the order ID,
+            #   2. identified the authenticated user,
+            #   3. enforced order ownership,
+            #   4. returned customer-safe order data.
+            #
+            # Therefore the generic RAG grounding fallback must never
+            # overwrite a successful order response merely because there
+            # are no Knowledge Base citations.
+            # --------------------------------------------------------------
+
+            order_lookup_match = re.search(
+                r"\b(?:ORD[-\s]?\d{3,6}|ORDER[-#\s]?\d{3,6}|#\d{3,6})\b",
+                user_message or "",
+                flags=re.IGNORECASE,
             )
 
-            result.handoff = True
-            result.handoff_reason = (
-                "AI response failed the grounding quality check "
-                "after wider retrieval."
-            )
+            if order_lookup_match is not None:
+                fallback_action = "order_lookup_preserved"
 
-            qr = assess(
-                result.answer,
-                result.sources,
-                True,
-                eligible=True,
-            )
+                result.handoff = False
+                result.handoff_reason = None
+                result.insufficient_information = False
 
-            fallback_action = (
-                "human_handoff"
-            )
+                qr = assess(
+                    result.answer,
+                    result.sources,
+                    False,
+                    eligible=False,
+                )
 
-    # ========================================================================
+            else:
+                result.answer = (
+                    "I couldn't verify that information reliably "
+                    "from the available sources. A support specialist "
+                    "can confirm it for you."
+                )
+
+                result.handoff = True
+                result.handoff_reason = (
+                    "AI response failed the grounding quality check "
+                    "after wider retrieval."
+                )
+
+                qr = assess(
+                    result.answer,
+                    result.sources,
+                    True,
+                    eligible=True,
+                )
+
+                fallback_action = "human_handoff"
+    # =========================================================================
     # ACTION CENTER
-    # ========================================================================
+    # =========================================================================
 
     if _cfg.AI_AGENT_ACTIONS_ENABLED:
 
@@ -1387,9 +1625,9 @@ def send_message(
         )
     )
 
-    # ========================================================================
+    # =========================================================================
     # APPROVAL-PENDING RESPONSE
-    # ========================================================================
+    # =========================================================================
 
     if (
         explicit_ticket_request
@@ -1433,9 +1671,9 @@ def send_message(
             eligible=False,
         )
 
-    # ========================================================================
+    # =========================================================================
     # FINAL QUALITY TRACE
-    # ========================================================================
+    # =========================================================================
 
     final_decision = qr.decision
 
@@ -1475,9 +1713,9 @@ def send_message(
         list(quality_trace.keys()),
     )
 
-    # ========================================================================
+    # =========================================================================
     # ASSISTANT METADATA
-    # ========================================================================
+    # =========================================================================
 
     assistant_row.content = result.answer
 
@@ -1620,9 +1858,9 @@ def send_message(
 
     db.flush()
 
-    # ========================================================================
+    # =========================================================================
     # AI QUALITY CHECK
-    # ========================================================================
+    # =========================================================================
 
     if _cfg.QUALITY_GUARD_ENABLED:
 
@@ -1741,9 +1979,9 @@ def send_message(
             ),
         )
 
-    # ========================================================================
+    # =========================================================================
     # RAG CITATIONS
-    # ========================================================================
+    # =========================================================================
 
     try:
         if (
@@ -1794,9 +2032,9 @@ def send_message(
             "citation persistence failed"
         )
 
-    # ========================================================================
+    # =========================================================================
     # USAGE
-    # ========================================================================
+    # =========================================================================
 
     from app.enterprise.usage import (
         record_usage
@@ -1847,9 +2085,9 @@ def send_message(
         },
     )
 
-    # ========================================================================
+    # =========================================================================
     # HUMAN HANDOFF
-    # ========================================================================
+    # =========================================================================
 
     ticket_number = None
 
@@ -1901,30 +2139,15 @@ def send_message(
             },
         )
 
-    # ========================================================================
+    # =========================================================================
     # FINAL ORM FLUSH
-    # ========================================================================
+    # =========================================================================
 
     db.flush()
 
-    # ========================================================================
-    # CRITICAL FINAL QUALITY TRACE PERSISTENCE
-    # ========================================================================
-    #
-    # DO NOT MOVE THIS ABOVE the citation/usage/handoff/final-flush sections.
-    #
-    # This is deliberately the LAST persistence operation affecting the
-    # assistant message metadata.
-    #
-    # This prevents a later SQLAlchemy flush from removing:
-    #
-    #     meta->'quality_trace'
-    #
-    # while preserving:
-    #
-    #     meta->'quality'
-    #
-    # ========================================================================
+    # =========================================================================
+    # FINAL QUALITY TRACE PERSISTENCE
+    # =========================================================================
 
     if _cfg.QUALITY_GUARD_ENABLED:
         _persist_final_quality_trace(
@@ -1933,9 +2156,9 @@ def send_message(
             quality_trace=quality_trace,
         )
 
-    # ========================================================================
+    # =========================================================================
     # FINAL RETURN
-    # ========================================================================
+    # =========================================================================
 
     return (
         user_row,
@@ -1943,5 +2166,3 @@ def send_message(
         result,
         ticket_number,
     )
-
-

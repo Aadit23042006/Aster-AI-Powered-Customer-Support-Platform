@@ -637,40 +637,32 @@ async def chat_attachment(
     org=Depends(get_current_org),
     db: Session = Depends(get_db),
 ):
-    """Upload a secure chat attachment and keep it visible in the conversation.
-
-    Image uploads receive vision analysis. PDFs, DOCX, TXT/CSV/JSON/Markdown and
-    spreadsheets receive text extraction so the next user question can use the
-    file as conversation context. The original bytes are stored against the
-    caller's attachment record so the conversation can render the attachment
-    again after refresh/reopen.
-    """
+    """Upload a secure chat attachment and keep it visible in the conversation."""
     from app import config
 
     filename = (file.filename or "attachment").strip()[:255]
+
     suffix = (
         f".{filename.rsplit('.', 1)[-1].lower()}"
         if "." in filename
         else ""
     )
+
     content_type = (
         file.content_type
         or "application/octet-stream"
     )
 
-    if (
-        content_type not in CHAT_ATTACHMENT_TYPES
-        and suffix not in CHAT_ATTACHMENT_EXTENSIONS
-    ):
+    # Phase 4 chat attachments must be images.
+    # Reject PDFs, TXT, DOCX, CSV, JSON, spreadsheets, etc.
+    if not content_type.startswith("image/"):
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Unsupported file type. Supported files: "
-                "images, PDF, DOC/DOCX, TXT, CSV, Markdown, JSON and XLS/XLSX."
-            ),
+            detail="Only image attachments are supported.",
         )
 
     raw = await file.read()
+
     max_size = (
         config.CHAT_ATTACHMENT_MAX_SIZE_MB * 1024 * 1024
     )
@@ -700,6 +692,7 @@ async def chat_attachment(
             )
             .first()
         )
+
         if not conversation:
             raise HTTPException(
                 status_code=404,
@@ -723,22 +716,25 @@ async def chat_attachment(
         file_data=raw,
         analysis_status="pending",
     )
+
     db.add(row)
     db.flush()
 
     try:
         is_image = content_type.startswith("image/") or suffix in {
-            ".jpg", ".jpeg", ".png", ".webp"
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
         }
 
         if is_image:
             if not config.IMAGE_SUPPORT_ENABLED:
-                # The attachment itself is still valid. Keep it visible so the
-                # user can send the question instead of losing the upload.
                 row.analysis_text = (
                     "Image attached. Image analysis is currently disabled, "
                     "but the original image remains available in this conversation."
                 )
+
             elif len(raw) > config.MAX_IMAGE_SIZE_MB * 1024 * 1024:
                 raise HTTPException(
                     status_code=400,
@@ -747,116 +743,102 @@ async def chat_attachment(
                         f"{config.MAX_IMAGE_SIZE_MB} MB"
                     ),
                 )
+
             else:
                 from app.phase4.providers import GeminiVisionProvider
 
                 if not config.GEMINI_API_KEY:
-                    raise RuntimeError("GEMINI_API_KEY is not configured")
+                    raise RuntimeError(
+                        "GEMINI_API_KEY is not configured"
+                    )
 
-                # Use the configured primary model and then a known fallback.
-                # A temporary Gemini 429/5xx must not make the user's upload
-                # disappear from the conversation.
                 models = [config.CHAT_MODEL]
-                fallback_model = getattr(config, "CHAT_FALLBACK_MODEL", "")
-                if fallback_model and fallback_model not in models:
+
+                fallback_model = getattr(
+                    config,
+                    "CHAT_FALLBACK_MODEL",
+                    "",
+                )
+
+                if (
+                    fallback_model
+                    and fallback_model not in models
+                ):
                     models.append(fallback_model)
 
                 analysis = ""
                 last_error: Exception | None = None
+
                 for model_name in models:
                     try:
                         provider = GeminiVisionProvider(
                             config.GEMINI_API_KEY,
                             model_name,
                         )
+
                         analysis = provider.analyze(
                             raw,
-                            mime_type=(
-                                content_type
-                                if content_type.startswith("image/")
-                                else "image/jpeg"
-                            ),
+                            mime_type=content_type,
                             prompt=(
                                 "Analyze this customer-support image. "
                                 "Describe only visible, relevant facts. "
-                                "Do not infer private information or make claims "
-                                "not supported by the image."
+                                "Do not infer private information or make "
+                                "claims not supported by the image."
                             ),
                         )
+
                         if analysis:
                             break
+
                     except Exception as exc:
                         last_error = exc
+
                         logger.warning(
-                            "Vision analysis failed with model %s; trying fallback: %s",
+                            "Vision analysis failed with model %s; "
+                            "trying fallback: %s",
                             model_name,
                             exc,
                         )
 
                 if analysis:
                     row.analysis_text = analysis[:10000]
+
                 else:
-                    # Preserve the attachment even if the AI provider is
-                    # temporarily unavailable. The question can still be sent
-                    # and the original image remains visible/openable.
                     row.analysis_text = (
-                        "Image attached successfully. Automatic image analysis "
-                        "is temporarily unavailable; the original image remains "
-                        "available in this conversation."
+                        "Image attached successfully. Automatic image "
+                        "analysis is temporarily unavailable; the original "
+                        "image remains available in this conversation."
                     )
+
                     if last_error:
-                        logger.exception(
-                            "All configured vision models failed for %s",
+                        logger.error(
+                            "All configured vision models failed for %s: %s",
                             filename,
-                            exc_info=last_error,
+                            last_error,
                         )
 
-        else:
-            try:
-                extracted = _extract_text_attachment(
-                    raw, content_type, filename
-                )
-            except Exception as exc:
-                # A malformed/legacy document should not make the attachment
-                # disappear. Keep the bytes and make the limitation explicit.
-                logger.warning(
-                    "Text extraction failed for %s: %s",
-                    filename,
-                    exc,
-                )
-                extracted = ""
-
-            row.analysis_text = (
-                extracted
-                if extracted
-                else (
-                    f"Attached file: {filename}. "
-                    "No text could be extracted automatically. "
-                    "The original file remains available in this conversation."
-                )
-            )
-
-        # Upload success is independent from optional AI/extraction success.
-        # This is critical for the conversation UX: an attachment must remain
-        # visible beside the user's question even when processing is degraded.
         row.analysis_status = "completed"
+
         db.commit()
         db.refresh(row)
 
     except HTTPException:
         db.rollback()
         raise
+
     except Exception as exc:
         db.rollback()
+
         logger.exception(
-            "Chat attachment processing failed before attachment could be saved: %s",
+            "Chat attachment processing failed: %s",
             exc,
         )
+
         raise HTTPException(
             status_code=503,
             detail=(
-                "The attachment could not be saved. Please try again or "
-                "use a smaller supported file."
+                "The attachment could not be saved. Please try again "
+                "or use a supported image file."
             ),
         ) from exc
 
