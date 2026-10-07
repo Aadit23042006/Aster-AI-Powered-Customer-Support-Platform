@@ -12,6 +12,10 @@ The test suite can run in either of these environments:
        PostgreSQL -> postgres:5432
        Redis      -> redis:6379
 
+3. GitHub Actions service containers:
+       PostgreSQL -> 127.0.0.1:5432
+       Redis      -> 127.0.0.1:6379
+
 IMPORTANT:
 All environment variables must be configured BEFORE importing any
 `app.*` module because application configuration/database modules may
@@ -48,10 +52,13 @@ import os
 #     could not translate host name "postgres"
 #
 # Docker uses the service hostname "postgres".
-# Windows uses the published host port 15432.
+# Local Windows uses the published host port 15432.
+# GitHub Actions uses the service container's published port 5432.
 #
 
 if os.path.exists("/.dockerenv"):
+    # Tests running inside the backend container use the Compose service
+    # hostname and container port.
     TEST_DATABASE_URL = (
         os.environ.get("TEST_DATABASE_URL")
         or os.environ.get("DATABASE_URL")
@@ -61,8 +68,17 @@ if os.path.exists("/.dockerenv"):
             "aster_row_test"
         )
     )
+elif os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+    # GitHub Actions runs pytest on the runner while PostgreSQL is provided
+    # as a service container published on the runner's port 5432.
+    TEST_DATABASE_URL = (
+        "postgresql+psycopg2://"
+        "postgres:postgres@127.0.0.1:5432/"
+        "aster_row_test"
+    )
 else:
-    # Windows / host pytest must ALWAYS use localhost.
+    # Local Windows / host pytest uses the project's published PostgreSQL
+    # port 15432.
     TEST_DATABASE_URL = (
         "postgresql+psycopg2://"
         "postgres:postgres@127.0.0.1:15432/"
